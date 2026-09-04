@@ -3,7 +3,13 @@
 import pytest
 
 from hisiburn import protocol
-from hisiburn.agent import AgentError, BurnAgent, CommandFailed, flash_timeout_ms
+from hisiburn.agent import (
+    FLASH_TIMEOUT_FLOOR_MS,
+    AgentError,
+    BurnAgent,
+    CommandFailed,
+    flash_timeout_ms,
+)
 
 
 def test_ping_uses_the_open_frame_both_stages_accept(pipe):
@@ -167,3 +173,12 @@ def test_ping_never_opens_with_a_start_frame(pipe):
     pipe.queue_ack()
     BurnAgent(pipe).ping()
     assert pipe.writes[0][0] != protocol.OP_START
+
+
+def test_flash_timeouts_clear_the_measured_hardware_rates():
+    # From the captured session: 10 MiB erase took 27.3 s, 5.44 MiB write took
+    # 8.5 s. Timeouts must leave real headroom over both.
+    assert flash_timeout_ms(10 * 1024 * 1024) > 27_300 * 2
+    assert flash_timeout_ms(int(5.44 * 1024 * 1024)) > 8_500 * 2
+    # A whole 16 MiB chip erase must not be capped by the floor.
+    assert flash_timeout_ms(16 * 1024 * 1024) > FLASH_TIMEOUT_FLOOR_MS

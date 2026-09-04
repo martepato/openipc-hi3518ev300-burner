@@ -34,8 +34,11 @@ STREAM_CHUNK = 64 * 1024
 #: Commands that only talk to the agent return almost immediately.
 DEFAULT_COMMAND_TIMEOUT_MS = 10_000
 
-#: NOR erase and write run at roughly a megabyte per second in the worst case;
-#: budget generously so a slow chip is not mistaken for a hang.
+#: Timed from a captured HiBurn session on an EN25QH128A: erase ran at about
+#: 2.7 s/MiB (10 MiB in 27.3 s) and write at about 1.6 s/MiB (5.4 MiB in
+#: 8.5 s). This budget keeps roughly a four-fold margin over the slower of the
+#: two, so a merely slow chip is never mistaken for a hang -- a timeout in the
+#: middle of a write does not stop the device, it just desynchronises us.
 FLASH_MS_PER_MIB = 12_000
 FLASH_TIMEOUT_FLOOR_MS = 30_000
 
