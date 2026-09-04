@@ -192,3 +192,50 @@ def test_probe_filters_by_pid(capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "12d1:d001" in out
     assert "12d1:1234" not in out
+
+
+# --- probe diagnosis --------------------------------------------------------
+
+
+def _pipe_for_probe(pipe, monkeypatch):
+    """Point probe --verbose at a fake pipe instead of real hardware."""
+    from hisiburn.usbdev import FoundDevice
+
+    device = FoundDevice(0x12D1, 0xD001, 2, 6, "Hislicon", "HiUSBBurn")
+    pipe.info = device
+    pipe.ep_out = type("E", (), {"bEndpointAddress": 0x01, "wMaxPacketSize": 512})()
+    pipe.ep_in = type("E", (), {"bEndpointAddress": 0x81, "wMaxPacketSize": 512})()
+    monkeypatch.setattr("hisiburn.cli.list_devices", lambda: [device])
+    monkeypatch.setattr("hisiburn.cli.find_device", lambda pid: object())
+    monkeypatch.setattr("hisiburn.cli.BulkPipe", lambda dev: pipe)
+    return pipe
+
+
+def test_probe_identifies_a_boot_rom(capsys, pipe, monkeypatch):
+    _pipe_for_probe(pipe, monkeypatch)
+    pipe.queue_timeout()  # boot ROM sends no greeting
+    pipe.queue_ack()  # answers OPEN, but nothing after that
+    assert main(["probe", "-v"]) == 0
+    out = capsys.readouterr().out
+    assert "session open (FE): acknowledged" in out
+    assert "boot ROM, waiting for a download" in out
+
+
+def test_probe_identifies_a_burn_agent(capsys, pipe, monkeypatch):
+    _pipe_for_probe(pipe, monkeypatch)
+    pipe.queue(b"start download process.\x00")
+    pipe.queue_ack()
+    pipe.queue_command_ok("version: U-Boot 2016.11-g131d3f2\r\n")
+    assert main(["probe", "-v"]) == 0
+    out = capsys.readouterr().out
+    assert "start download process." in out
+    assert "burn agent, ready to flash" in out
+
+
+def test_probe_reports_a_device_that_answers_nothing(capsys, pipe, monkeypatch):
+    _pipe_for_probe(pipe, monkeypatch)
+    pipe.queue_timeout(2)  # silent to both the greeting read and the OPEN frame
+    assert main(["probe", "-v"]) == 0
+    out = capsys.readouterr().out
+    assert "session open (FE): no reply" in out
+    assert "Power-cycle" in out

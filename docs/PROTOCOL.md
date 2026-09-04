@@ -192,12 +192,22 @@ bytes down against the announced length and only completes on a short packet.
 
 ### Distinguishing the stages
 
-Both stages answer `FA` with an ACK, so a ping proves only that *something* is
-listening. The discriminator is a command only U-Boot implements:
+**Open with `FE <token> <token>`, not `FA`.** Both stages accept OPEN as a
+first frame — it is what HiBurn sends to the boot ROM before anything else,
+and the agent handles the same shape. `FA` was only ever observed mid-session
+against a running agent, and a real boot ROM **stalls its bulk endpoint** on
+it. On macOS that stall persists: every later transfer fails with `EIO` until
+`clear_halt` is issued, so one unrecognised opcode makes the device look dead.
+
+An ACK to OPEN proves only that *something* is listening. The discriminator is
+a command only U-Boot implements:
 
 ```
 AB 00 0F "getinfo version"   ->  " version: U-Boot 2016.11-g131d3f2\n[EOT](OK)\r\n"
 ```
+
+The boot ROM has no command interpreter and may stall on the attempt, so clear
+the halt afterwards before doing anything else.
 
 ## Flashing sequence
 
@@ -238,6 +248,7 @@ Finally, `reset`.
 | Flashing command sequence | captured command frames + HiBurn log |
 | Zero-length packets during long commands | observed during `sf erase` |
 | Error path stops the session | vendor source (`usb3_prot.c`), not exercised in the capture |
+| Boot ROM stalls on a `FA` first frame | observed on hardware (Hi3518EV300, macOS) |
 
 The one item resting on source rather than observation is the last: a failed
 command was never provoked in the captured run.

@@ -8,6 +8,10 @@ import pytest
 
 from hisiburn.usbdev import UsbError
 
+#: Queue this instead of bytes to make the next read behave like a silent
+#: device: the real pipe raises UsbError on a timeout.
+TIMEOUT = object()
+
 
 class FakePipe:
     """Stands in for :class:`hisiburn.usbdev.BulkPipe`.
@@ -24,6 +28,10 @@ class FakePipe:
 
     def queue(self, *replies: bytes) -> None:
         self.replies.extend(replies)
+
+    def queue_timeout(self, count: int = 1) -> None:
+        """Queue reads that behave like a device saying nothing."""
+        self.replies.extend([TIMEOUT] * count)
 
     def queue_ack(self, count: int = 1) -> None:
         # The device sends strlen(s) + 1 bytes, so a bare ACK arrives padded.
@@ -45,7 +53,10 @@ class FakePipe:
             # some callers legitimately expect that (`reset` reboots the
             # camera mid-command), so model the timeout rather than asserting.
             raise UsbError("no reply queued: the device would have timed out here")
-        return self.replies.popleft()
+        reply = self.replies.popleft()
+        if reply is TIMEOUT:
+            raise UsbError("queued timeout: the device said nothing")
+        return reply
 
     def read_byte(self, timeout_ms: int | None = None) -> int:
         data = self.read(timeout_ms=timeout_ms)
@@ -53,8 +64,19 @@ class FakePipe:
             raise AssertionError("queued an empty reply where a status byte was expected")
         return data[0]
 
+    def clear_halt(self) -> None:
+        pass
+
     def close(self) -> None:
         self.closed = True
+
+    # Dunder lookup is on the type, so these have to live on the class for
+    # `with BulkPipe(...) as pipe:` to work against this double.
+    def __enter__(self) -> FakePipe:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
 
 @pytest.fixture

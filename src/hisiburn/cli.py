@@ -135,24 +135,52 @@ def cmd_probe(args: argparse.Namespace) -> int:
     for device in devices:
         try:
             with BulkPipe(find_device(device.product_id)) as pipe:
-                print(f"{device.vendor_id:04x}:{device.product_id:04x} endpoints:")
-                print(
-                    f"  bulk OUT 0x{pipe.ep_out.bEndpointAddress:02x} "
-                    f"maxpacket {pipe.ep_out.wMaxPacketSize}"
-                )
-                print(
-                    f"  bulk IN  0x{pipe.ep_in.bEndpointAddress:02x} "
-                    f"maxpacket {pipe.ep_in.wMaxPacketSize}"
-                )
-                agent = BurnAgent(pipe)
-                greeting = agent.read_greeting()
-                if greeting:
-                    print(f"  greeting: {greeting}")
-                print(f"  answers a sync frame: {agent.ping()}")
-                print(f"  running the burn agent: {agent.is_agent()}")
+                _describe_pipe(pipe)
         except (UsbError, DeviceNotFound) as exc:
             print(f"  could not open: {exc}")
     return 0
+
+
+def _describe_pipe(pipe: BulkPipe) -> None:
+    """Print endpoints and work out which stage is answering."""
+    info = pipe.info
+    print(f"{info.vendor_id:04x}:{info.product_id:04x} endpoints:")
+    print(
+        f"  bulk OUT 0x{pipe.ep_out.bEndpointAddress:02x} "
+        f"maxpacket {pipe.ep_out.wMaxPacketSize}"
+    )
+    print(
+        f"  bulk IN  0x{pipe.ep_in.bEndpointAddress:02x} "
+        f"maxpacket {pipe.ep_in.wMaxPacketSize}"
+    )
+
+    agent = BurnAgent(pipe)
+    greeting = agent.read_greeting()
+    if greeting:
+        print(f"  greeting: {greeting!r}")
+
+    # OPEN is the one frame both stages accept before anything else. The boot
+    # ROM stalls its endpoint on a START frame, so it must not be used here.
+    if not agent.ping():
+        print("  session open (FE): no reply")
+        print("  -> nothing is answering. Power-cycle into download mode and retry.")
+        return
+    print("  session open (FE): acknowledged")
+
+    # Only U-Boot implements getinfo. The boot ROM may stall on the attempt,
+    # which the pipe recovers from.
+    result = None
+    try:
+        result = agent.try_command("getinfo version", timeout_ms=3000)
+    except (AgentError, UsbError) as exc:
+        log.debug("getinfo probe failed: %s", exc)
+
+    if result is not None and result.ok:
+        print(f"  getinfo version: {result.output}")
+        print("  -> burn agent, ready to flash")
+    else:
+        print("  getinfo version: no reply")
+        print("  -> boot ROM, waiting for a download: hisiburn boot -f u-boot.bin")
 
 
 def cmd_info(args: argparse.Namespace) -> int:

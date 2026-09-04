@@ -111,11 +111,16 @@ class BurnAgent:
     def ping(self) -> bool:
         """Check that something is listening. Returns False rather than raising.
 
-        A bare ACK does not prove it is the *agent* — the boot ROM answers the
-        same frames. Use :meth:`is_agent` when the distinction matters.
+        Uses the OPEN frame rather than the START frame. Both stages accept
+        OPEN as an opening frame — it is the first thing HiBurn sends to the
+        boot ROM — whereas START was only ever observed mid-session against a
+        running agent, and the boot ROM stalls its endpoint on it.
+
+        An ACK does not prove it is the *agent*; the boot ROM answers this too.
+        Use :meth:`is_agent` when the distinction matters.
         """
         try:
-            self.pipe.write(protocol.start_frame())
+            self.pipe.write(protocol.open_frame())
             return self.pipe.read_byte(timeout_ms=2000) == protocol.ACK
         except (UsbError, AgentError) as exc:
             log.debug("ping failed: %s", exc)

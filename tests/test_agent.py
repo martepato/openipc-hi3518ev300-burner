@@ -6,11 +6,17 @@ from hisiburn import protocol
 from hisiburn.agent import AgentError, BurnAgent, CommandFailed, flash_timeout_ms
 
 
-def test_ping_accepts_an_ack(pipe):
+def test_ping_uses_the_open_frame_both_stages_accept(pipe):
+    # The boot ROM stalls its endpoint on a START frame -- HiBurn never opens
+    # with one. OPEN is what it actually sends first, and the agent takes it
+    # too, so it is the only safe liveness probe before the stage is known.
     pipe.queue_ack()
     assert BurnAgent(pipe).ping()
-    assert pipe.writes[0][0] == protocol.OP_START
-    assert len(pipe.writes[0]) == 9
+    assert pipe.writes[0] == protocol.open_frame(
+        int.from_bytes(pipe.writes[0][1:5], "big")
+    )
+    assert pipe.writes[0][0] == protocol.OP_HEAD
+    assert pipe.writes[0][1:5] == pipe.writes[0][5:9]
 
 
 def test_ping_reports_silence_rather_than_raising(pipe):
@@ -153,3 +159,11 @@ def test_reset_tolerates_the_device_vanishing(pipe):
 def test_flash_timeout_scales_with_size():
     assert flash_timeout_ms(0x10000) == 30_000  # floor
     assert flash_timeout_ms(10 * 1024 * 1024) > 30_000
+
+
+def test_ping_never_opens_with_a_start_frame(pipe):
+    # Regression: leading with 0xFA stalled a real boot ROM's endpoint, and on
+    # macOS the stall then failed every later transfer with EIO.
+    pipe.queue_ack()
+    BurnAgent(pipe).ping()
+    assert pipe.writes[0][0] != protocol.OP_START

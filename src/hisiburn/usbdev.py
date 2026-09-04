@@ -237,11 +237,26 @@ class BulkPipe:
     def max_packet_size(self) -> int:
         return int(self.ep_out.wMaxPacketSize)
 
+    def clear_halt(self) -> None:
+        """Clear a stall on both bulk endpoints.
+
+        A device that does not recognise a frame can stall its endpoint, and
+        on macOS the stall persists: every later transfer fails with EIO until
+        it is cleared. Without this, one unrecognised opcode kills the pipe and
+        every subsequent operation reports a misleading I/O error.
+        """
+        for endpoint in (self.ep_out, self.ep_in):
+            try:
+                self.device.clear_halt(endpoint.bEndpointAddress)
+            except usb.core.USBError as exc:
+                log.debug("clear_halt on 0x%02x failed: %s", endpoint.bEndpointAddress, exc)
+
     def write(self, data: bytes, timeout_ms: int | None = None) -> int:
         """Send ``data`` on the bulk OUT endpoint."""
         try:
             return self.ep_out.write(data, timeout_ms or self.timeout_ms)
         except usb.core.USBError as exc:
+            self.clear_halt()
             raise UsbError(f"bulk write of {len(data)} bytes failed: {exc}") from exc
 
     def read(self, length: int | None = None, timeout_ms: int | None = None) -> bytes:
@@ -250,6 +265,7 @@ class BulkPipe:
         try:
             return bytes(self.ep_in.read(size, timeout_ms or self.timeout_ms))
         except usb.core.USBError as exc:
+            self.clear_halt()
             raise UsbError(f"bulk read failed: {exc}") from exc
 
     def read_byte(self, timeout_ms: int | None = None) -> int:
