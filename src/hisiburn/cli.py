@@ -1,0 +1,395 @@
+"""Command-line interface."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+import time
+from pathlib import Path
+
+from hisiburn import __version__
+from hisiburn.agent import AgentError, BurnAgent
+from hisiburn.bootrom import PROFILES, BootRom, BootRomError
+from hisiburn.flash import PlanError, build_plan, run_plan, verify_flash_chip
+from hisiburn.hitool_log import LogParseError, layout_from_log, parse_sessions
+from hisiburn.layout import BUILTIN_LAYOUTS, FlashLayout, LayoutError, get_layout
+from hisiburn.usbdev import (
+    PID_AGENT,
+    PID_BOOTROM,
+    BulkPipe,
+    DeviceNotFound,
+    UsbError,
+    find_device,
+    list_devices,
+    wait_for_device,
+)
+
+log = logging.getLogger("hisiburn")
+
+
+class CliError(Exception):
+    """Anything the user can fix, reported without a traceback."""
+
+
+# --- output helpers ---------------------------------------------------------
+
+
+def step(message: str) -> None:
+    print(f"  {message}", flush=True)
+
+
+class ProgressBar:
+    """A single-line transfer meter that stays quiet when output is piped."""
+
+    def __init__(self, label: str, enabled: bool = True):
+        self.label = label
+        self.enabled = enabled and sys.stdout.isatty()
+        self._last = 0.0
+
+    def __call__(self, sent: int, total: int) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if sent < total and now - self._last < 0.1:
+            return
+        self._last = now
+        share = sent / total if total else 1.0
+        filled = int(share * 32)
+        bar = "#" * filled + "-" * (32 - filled)
+        end = "\n" if sent >= total else ""
+        print(
+            f"\r  {self.label} [{bar}] {share * 100:5.1f}%  {sent // 1024} KiB",
+            end=end,
+            flush=True,
+        )
+
+
+# --- device helpers ---------------------------------------------------------
+
+
+def open_pipe(product_id: int | None, wait: float) -> BulkPipe:
+    device = wait_for_device(product_id, timeout=wait) if wait else find_device(product_id)
+    return BulkPipe(device)
+
+
+def connect_agent(product_id: int | None, wait: float) -> tuple[BulkPipe, BurnAgent]:
+    """Open the camera and confirm a burn agent is answering on it."""
+    pipe = open_pipe(product_id or PID_AGENT, wait)
+    agent = BurnAgent(pipe)
+    if not agent.ping():
+        pipe.close()
+        raise CliError(
+            "the device is attached but no burn agent answered. If it is still in "
+            "boot ROM mode, run `hisiburn boot -f u-boot.bin` first."
+        )
+    agent.open_channel()
+    return pipe, agent
+
+
+# --- commands ---------------------------------------------------------------
+
+
+def cmd_probe(args: argparse.Namespace) -> int:
+    devices = list_devices()
+    if not devices:
+        print("No HiSilicon USB device found (vendor 12d1).")
+        print()
+        print("To put the camera into download mode:")
+        print("  1. unplug it")
+        print("  2. hold the reset button down")
+        print("  3. plug the USB cable back in, still holding")
+        print("  4. keep holding for a couple of seconds, then run this again")
+        print()
+        print("macOS needs no driver for this — if nothing appears, the camera is")
+        print("not entering download mode rather than being unsupported.")
+        return 1
+
+    print(f"Found {len(devices)} HiSilicon device(s):")
+    for device in devices:
+        print(f"  {device}")
+
+    if not args.verbose:
+        return 0
+
+    print()
+    for device in devices:
+        try:
+            with BulkPipe(find_device(device.product_id)) as pipe:
+                print(f"{device.vendor_id:04x}:{device.product_id:04x} endpoints:")
+                print(
+                    f"  bulk OUT 0x{pipe.ep_out.bEndpointAddress:02x} "
+                    f"maxpacket {pipe.ep_out.wMaxPacketSize}"
+                )
+                print(
+                    f"  bulk IN  0x{pipe.ep_in.bEndpointAddress:02x} "
+                    f"maxpacket {pipe.ep_in.wMaxPacketSize}"
+                )
+                agent = BurnAgent(pipe)
+                print(f"  burn agent answers ping: {agent.ping()}")
+        except (UsbError, DeviceNotFound) as exc:
+            print(f"  could not open: {exc}")
+    return 0
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    pipe, agent = connect_agent(args.pid, args.wait)
+    try:
+        for topic in ("version", "bootmode", "spi"):
+            value = " ".join(agent.get_info(topic).split())
+            print(f"{topic:<10} {value}")
+    finally:
+        pipe.close()
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    pipe, agent = connect_agent(args.pid, args.wait)
+    try:
+        for command in args.command:
+            result = agent.try_command(command, timeout_ms=args.timeout * 1000)
+            print(f"$ {command}")
+            if result.output:
+                print(result.output)
+            print("OK" if result.ok else "ERROR")
+            if not result.ok:
+                return 1
+    finally:
+        pipe.close()
+    return 0
+
+
+def cmd_boot(args: argparse.Namespace) -> int:
+    uboot = Path(args.file)
+    if not uboot.is_file():
+        raise CliError(f"U-Boot image not found: {uboot}")
+    profile = PROFILES.get(args.chip)
+    if profile is None:
+        raise CliError(f"unknown chip {args.chip!r} (known: {', '.join(sorted(PROFILES))})")
+
+    data = uboot.read_bytes()
+    print(f"Loading {uboot.name} ({len(data)} bytes) via the boot ROM...")
+
+    pipe = open_pipe(args.pid or PID_BOOTROM, args.wait)
+    try:
+        BootRom(pipe).boot_uboot(data, profile, on_progress=ProgressBar("upload"))
+    finally:
+        pipe.close()
+
+    print("U-Boot started. Waiting for the burn agent to enumerate...")
+    try:
+        device = wait_for_device(PID_AGENT, timeout=15.0)
+    except DeviceNotFound as exc:
+        raise CliError(
+            f"{exc}\nThe images went across but the agent did not come up. "
+            "Check that this U-Boot was built with HiSilicon's usbtftp support."
+        ) from exc
+
+    with BulkPipe(device) as pipe:
+        agent = BurnAgent(pipe)
+        if agent.ping():
+            agent.open_channel()
+            print(f"Agent ready: {agent.get_info('version')}")
+        else:
+            print("Agent enumerated but did not answer a ping.")
+    return 0
+
+
+def _resolve_layout(args: argparse.Namespace) -> FlashLayout:
+    if args.layout_file:
+        return FlashLayout.load(Path(args.layout_file))
+    if args.from_log:
+        return layout_from_log(Path(args.from_log))
+    return get_layout(args.layout)
+
+
+def _parse_overrides(values: list[str] | None) -> dict[str, Path]:
+    overrides: dict[str, Path] = {}
+    for value in values or []:
+        name, separator, path = value.partition("=")
+        if not separator:
+            raise CliError(f"--image expects NAME=PATH, got {value!r}")
+        overrides[name] = Path(path)
+    return overrides
+
+
+def cmd_flash(args: argparse.Namespace) -> int:
+    layout = _resolve_layout(args)
+    plan = build_plan(
+        layout,
+        Path(args.dir),
+        only=set(args.only) if args.only else None,
+        overrides=_parse_overrides(args.image),
+    )
+
+    print(plan.describe())
+
+    if args.dry_run:
+        print("\nCommands that would be sent:")
+        for command in plan.commands():
+            print(f"  {command}")
+        return 0
+
+    if not args.yes:
+        print("\nThis erases the listed partitions. The camera cannot boot until it finishes.")
+        if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+
+    pipe, agent = connect_agent(args.pid, args.wait)
+    try:
+        print("\nFlashing:")
+        verify_flash_chip(agent, layout, step)
+        run_plan(
+            agent,
+            plan,
+            on_step=step,
+            on_progress=ProgressBar("upload"),
+            reset=not args.no_reset,
+        )
+    finally:
+        pipe.close()
+
+    print("\nDone. The camera should reboot into the new firmware.")
+    return 0
+
+
+def cmd_from_log(args: argparse.Namespace) -> int:
+    path = Path(args.log)
+    sessions = parse_sessions(path.read_text(errors="replace"))
+    if not sessions:
+        raise CliError(f"no flashing session found in {path}")
+
+    if args.list:
+        print(f"{len(sessions)} session(s) in {path}:")
+        for index, session in enumerate(sessions):
+            names = ", ".join(job.name or "?" for job in session.jobs)
+            print(f"  [{index}] chip={session.flash_chip or '?'} partitions: {names}")
+        return 0
+
+    layout = layout_from_log(path, session_index=args.session, name=args.name)
+    if args.output:
+        Path(args.output).write_text(layout.to_json())
+        print(f"Wrote {args.output}")
+    else:
+        print(layout.describe())
+        print()
+        print(layout.to_json())
+    return 0
+
+
+def cmd_layouts(args: argparse.Namespace) -> int:
+    if not BUILTIN_LAYOUTS:
+        print("No built-in layouts.")
+        return 0
+    for layout in BUILTIN_LAYOUTS.values():
+        print(layout.describe())
+        print()
+    return 0
+
+
+# --- argument parsing -------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hisiburn",
+        description=(
+            "Flash HiSilicon Hi3518EV300 cameras over USB from macOS or Linux. "
+            "An open replacement for HiTool/HiBurn that needs no driver install."
+        ),
+    )
+    parser.add_argument("--version", action="version", version=f"hisiburn {__version__}")
+    parser.add_argument("-v", "--verbose", action="store_true", help="log protocol detail")
+    parser.add_argument(
+        "--pid",
+        type=lambda value: int(value, 0),
+        help="override the USB product id to open",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="wait for the device to appear instead of failing immediately",
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    probe = sub.add_parser("probe", help="list attached HiSilicon devices")
+    probe.set_defaults(func=cmd_probe)
+
+    info = sub.add_parser("info", help="query a running burn agent")
+    info.set_defaults(func=cmd_info)
+
+    run = sub.add_parser("run", help="run U-Boot console commands through the agent")
+    run.add_argument("command", nargs="+", help="commands to run in order")
+    run.add_argument("--timeout", type=int, default=30, help="seconds per command")
+    run.set_defaults(func=cmd_run)
+
+    boot = sub.add_parser("boot", help="load and start U-Boot via the boot ROM")
+    boot.add_argument("-f", "--file", required=True, help="U-Boot binary")
+    boot.add_argument("-c", "--chip", default="hi3518ev300", help="chip profile")
+    boot.set_defaults(func=cmd_boot)
+
+    flash = sub.add_parser("flash", help="write a firmware set to the camera's flash")
+    flash.add_argument("-d", "--dir", default=".", help="directory holding the images")
+    flash.add_argument("-l", "--layout", default="mjsxj02hl-16m", help="built-in layout name")
+    flash.add_argument("--layout-file", help="JSON layout produced by `hisiburn from-log -o`")
+    flash.add_argument("--from-log", help="derive the layout from a HiBurn log")
+    flash.add_argument(
+        "--only", nargs="+", metavar="NAME", help="flash only these partitions"
+    )
+    flash.add_argument(
+        "--image",
+        action="append",
+        metavar="NAME=PATH",
+        help="use a specific file for a partition",
+    )
+    flash.add_argument("--dry-run", action="store_true", help="print commands, touch nothing")
+    flash.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    flash.add_argument("--no-reset", action="store_true", help="leave the camera halted")
+    flash.set_defaults(func=cmd_flash)
+
+    from_log = sub.add_parser("from-log", help="recover a flash layout from a HiBurn log")
+    from_log.add_argument("log", help="HiTool/HiBurn log file")
+    from_log.add_argument("--session", type=int, default=-1, help="which session (default: last)")
+    from_log.add_argument("--name", default="from-log", help="name for the layout")
+    from_log.add_argument("-o", "--output", help="write the layout as JSON")
+    from_log.add_argument("--list", action="store_true", help="list sessions and stop")
+    from_log.set_defaults(func=cmd_from_log)
+
+    layouts = sub.add_parser("layouts", help="show the built-in flash layouts")
+    layouts.set_defaults(func=cmd_layouts)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    try:
+        return args.func(args)
+    except (
+        CliError,
+        PlanError,
+        LayoutError,
+        LogParseError,
+        DeviceNotFound,
+        AgentError,
+        BootRomError,
+        UsbError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

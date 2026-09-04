@@ -1,0 +1,118 @@
+Platform Version: 5.4.9
+HiBurn Version: 5.3
+HiSilicon Technologies Co., Ltd. All rights reserved. (C) 2011-2019
+
+##################################################### ---- 10%
+############################################ ---- 100%
+Boot download completed!
+start download process.
+Boot started successfully!
+
+Send command:	getinfo version
+version: U-Boot 2016.11-g131d3f2
+[EOT](OK)
+
+Send command:	getinfo bootmode
+spi
+[EOT](OK)
+
+Send command:	sf probe 0
+[EOT](OK)
+
+Send command:	getinfo spi
+Block:64KB Chip:16MB*1 
+ID:0x1C 0x70 0x18 
+Name:"EN25QH128A"
+[EOT](OK)
+
+Send command:	sf erase 0x0 0x40000
+SF: 262144 bytes @ 0x0 Erased: OK
+[EOT](OK)
+
+Send command:	sf write 0x41000000 0x0 0x40000
+device 0 offset 0x0, size 0x40000
+SF: 262144 bytes @ 0x0 Written: [EOT](OK)
+
+Send command:	mw.b 0x41000000 0xFF 0x10000
+[EOT](OK)
+
+Send command:	Downloading File : env.bin
+
+[Download File by usb]
+file = D:\firmware\env.bin
+address = 0x41000000
+fileLength = 65536 B
+#
+done
+
+Send command:	sf probe 0
+[EOT](OK)
+
+Send command:	sf erase 0x40000 0x10000
+SF: 65536 bytes @ 0x40000 Erased: OK
+[EOT](OK)
+
+Send command:	sf write 0x41000000 0x40000 0x10000
+device 0 offset 0x40000, size 0x10000
+SF: 65536 bytes @ 0x40000 Written: OK
+[EOT](OK)
+Partition env burnt successfully!
+
+Send command:	mw.b 0x41000000 0xFF 0x1e0000
+[EOT](OK)
+
+Send command:	Downloading File : uImage.hi3518ev300
+
+[Download File by usb]
+file = D:\firmware\uImage.hi3518ev300
+address = 0x41000000
+fileLength = 1908952 B
+#
+done
+
+Send command:	sf probe 0
+[EOT](OK)
+
+Send command:	sf erase 0x50000 0x300000
+Erasing at 0x60000 --   2% complete.[EOT](OK)
+
+Send command:	sf write 0x41000000 0x50000 0x1e0000
+device 0 offset 0x50000, size 0x1e0000
+Writing at 0x60000 --   3% complete.[EOT](OK)
+Partition kernel burnt successfully!
+
+Send command:	mw.b 0x41000000 0xFF 0x570000
+[EOT](OK)
+
+Send command:	Downloading File : rootfs.squashfs.hi3518ev300
+
+[Download File by usb]
+file = D:\firmware\rootfs.squashfs.hi3518ev300
+address = 0x41000000
+fileLength = 5689344 B
+##
+done
+
+Send command:	sf probe 0
+[EOT](OK)
+
+Send command:	sf erase 0x350000 0xa00000
+Erasing at 0x360000 --   0% complete.[EOT](OK)
+
+Send command:	sf write 0x41000000 0x350000 0x570000
+device 0 offset 0x350000, size 0x570000
+Writing at 0x360000 --   1% complete.[EOT](OK)
+Partition rootfs burnt successfully!
+
+Send command:	sf probe 0
+[EOT](OK)
+
+Send command:	sf erase 0xd50000 0x2b0000
+Erasing at 0xd60000 --   2% complete.[EOT](OK)
+Partition rootfs_data burnt successfully!
+
+Send command:	reset
+reset success!
+Partition burnt completed!
+
+USB channels were closed successfully.
