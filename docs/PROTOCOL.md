@@ -36,9 +36,14 @@ bcdUSB            0x0200
 bInterfaceClass   0xFF     vendor-specific  (subclass 0xFF, protocol 0xFF)
 bNumEndpoints     2        bulk IN 0x81, bulk OUT 0x01
 wMaxPacketSize    512
-iManufacturer     "Hisilicon"
+iManufacturer     "Hislicon"     (sic - the typo is in the vendor's gadget source)
 iProduct          "HiUSBBurn"
 ```
+
+The misspelt manufacturer string is a useful fingerprint: it comes from
+``string_manu[] = {'H','i','s','l','i','c','o','n'}`` in the vendor's
+``cmd/usbtftp.c``, so seeing it confirms the device is running that gadget
+code and not something else answering on the same ids.
 
 The vendor-specific interface class is why the Windows workflow needs Zadig:
 no stock Windows driver binds a `0xFF` interface, so libusbK has to be
