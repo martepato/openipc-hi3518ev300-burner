@@ -233,11 +233,17 @@ def cmd_boot(args: argparse.Namespace) -> int:
     print("U-Boot started. Waiting for it to re-enumerate...")
     try:
         device = wait_for_device(args.pid, timeout=20.0, exclude=previous)
-    except DeviceNotFound as exc:
-        raise CliError(
-            f"{exc}\nThe images went across but nothing came back. Check that this "
-            "U-Boot was built with HiSilicon's usbtftp support."
-        ) from exc
+    except DeviceNotFound:
+        # A host can hand the device back its old address, which the exclusion
+        # above would then skip forever. Fall back to whatever is attached.
+        log.debug("no device at a new address; retrying without the exclusion")
+        try:
+            device = wait_for_device(args.pid, timeout=5.0)
+        except DeviceNotFound as exc:
+            raise CliError(
+                f"{exc}\nThe images went across but nothing came back. Check that "
+                "this U-Boot was built with HiSilicon's usbtftp support."
+            ) from exc
 
     with BulkPipe(device) as pipe:
         agent = BurnAgent(pipe)

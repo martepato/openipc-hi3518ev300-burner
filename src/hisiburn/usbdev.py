@@ -280,13 +280,22 @@ class BulkPipe:
         return data[0]
 
     def close(self) -> None:
+        """Release the device, tolerating one that has already gone away.
+
+        Stage 1 ends by starting U-Boot, so the device re-enumerates out from
+        under this handle. Tearing down a vanished device must not raise — the
+        flash succeeded either way.
+        """
         if self._claimed and self._interface_number is not None:
             try:
                 usb.util.release_interface(self.device, self._interface_number)
-            except usb.core.USBError as exc:
+            except (usb.core.USBError, ValueError) as exc:
                 log.debug("release_interface failed: %s", exc)
             self._claimed = False
-        usb.util.dispose_resources(self.device)
+        try:
+            usb.util.dispose_resources(self.device)
+        except (usb.core.USBError, ValueError) as exc:
+            log.debug("dispose_resources failed: %s", exc)
 
     def __enter__(self) -> BulkPipe:
         return self
