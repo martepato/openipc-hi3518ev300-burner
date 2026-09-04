@@ -13,14 +13,19 @@ Zadig, no libusbK, no driver installation of any kind.
 
 ## Status
 
-The stage-2 protocol — the one that actually erases and writes flash — is
-implemented from HiSilicon's own GPL U-Boot sources and is exercised by the
-test suite. The stage-1 boot-ROM handshake is implemented from the vendor's
-frame documentation and corroborated against OpenIPC's `defib`, but the
-USB-side entry into it has not yet been confirmed on hardware. See
-[docs/PROTOCOL.md](docs/PROTOCOL.md#confidence) for exactly what rests on what.
+Both stages are implemented against a **USBPcap capture of a real HiBurn 5.3
+flash**, not guesswork. The captured frames are checked into
+`tests/fixtures/captured_frames.json`, and the test suite asserts that this
+tool reproduces them byte for byte — including a replay test that compares our
+whole U-Boot command stream against HiBurn's, command for command.
 
-Nothing in stage 1 can brick a camera: it only writes to volatile memory.
+Not yet exercised on hardware *by this tool*: someone still has to run it end
+to end against a camera. Nothing in stage 1 can brick one — it only writes to
+volatile memory — and stage 2 checks every image size before the first erase.
+
+See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full protocol, including
+[what a source-only reading got wrong](docs/PROTOCOL.md#for-the-record-what-a-source-only-reading-got-wrong)
+before the capture existed.
 
 ## Install
 
@@ -48,8 +53,11 @@ hisiburn probe
 
 ```
 Found 1 HiSilicon device(s):
-  12d1:3609 at bus 20 device 7 [Hisilicon HiUSBBurn] — boot ROM (waiting for download)
+  12d1:d001 at bus 20 device 7 [Hisilicon HiUSBBurn] — HiUSBBurn (boot ROM or burn agent — ask it to tell them apart)
 ```
+
+Both stages present the same USB id, so `probe --verbose` asks the device
+which one is listening.
 
 If nothing appears, the camera is not entering download mode — that is a
 button-timing problem, not a driver problem.
@@ -60,7 +68,8 @@ button-timing problem, not a driver problem.
 hisiburn boot -f u-boot.bin
 ```
 
-The camera re-enumerates as `12d1:d001` running the burn agent:
+This sends the DDR-init stub, the SPL and the U-Boot image. The camera then
+re-enumerates at a new bus address, running the burn agent:
 
 ```sh
 hisiburn info
@@ -88,7 +97,7 @@ hisiburn flash -d ./openipc-firmware --dry-run
 Plan for mjsxj02hl-16m (5 partitions):
   boot: u-boot.bin (196608 bytes) -> 0x0, writing 0x30000
   env: env.bin (65536 bytes) -> 0x40000, writing 0x10000
-  kernel: uImage.hi3518ev300 (1908952 bytes) -> 0x50000, writing 0x1E0000
+  kernel: uImage.hi3518ev300 (1908952 bytes) -> 0x50000, writing 0x1e0000
   rootfs: rootfs.squashfs.hi3518ev300 (5689344 bytes) -> 0x350000, writing 0x570000
   rootfs_data: erase 0x2B0000 at 0xD50000
   total to transfer: 7.50 MiB
@@ -144,16 +153,24 @@ cover: USB only, no soldering.
 ## Protocol
 
 [docs/PROTOCOL.md](docs/PROTOCOL.md) documents both stages — USB ids,
-endpoints, frame layouts, the non-standard CRC, and the flashing command
+endpoints, every frame layout, the ACK cadence, and the flashing command
 sequence — with the provenance of each claim. As far as we can tell this is
 the only public write-up of the HiUSBBurn protocol.
 
+One finding worth pulling out, because it silently breaks anything built from
+UART sources: the 64-byte DDR stub also writes `START_MAGIC` ("DOWN") to
+`REG_START_FLAG`, and the U-Boot it loads refuses to enter download mode
+without it. OpenIPC `defib`'s profile has a different value in those four
+bytes. `ChipProfile` refuses to construct without the right one.
+
 ## Credits
 
-The protocol was recovered from GPL-licensed HiSilicon sources shipped in
+The protocol was read out of GPL-licensed HiSilicon sources shipped in
 [OpenIPC/u-boot-hi3516ev200](https://github.com/OpenIPC/u-boot-hi3516ev200)
 (`drivers/usb/gadget/hiudc3/`, `common/download_process.c`, `cmd/usbtftp.c`),
-and cross-checked against [OpenIPC/defib](https://github.com/OpenIPC/defib).
+cross-checked against [OpenIPC/defib](https://github.com/OpenIPC/defib), and
+then corrected against a USBPcap capture of a real HiBurn session — which is
+what turned it from a plausible reading into a verified one.
 
 ## License
 

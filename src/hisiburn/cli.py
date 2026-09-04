@@ -15,8 +15,6 @@ from hisiburn.flash import PlanError, build_plan, run_plan, verify_flash_chip
 from hisiburn.hitool_log import LogParseError, layout_from_log, parse_sessions
 from hisiburn.layout import BUILTIN_LAYOUTS, FlashLayout, LayoutError, get_layout
 from hisiburn.usbdev import (
-    PID_AGENT,
-    PID_BOOTROM,
     BulkPipe,
     DeviceNotFound,
     UsbError,
@@ -74,16 +72,17 @@ def open_pipe(product_id: int | None, wait: float) -> BulkPipe:
 
 
 def connect_agent(product_id: int | None, wait: float) -> tuple[BulkPipe, BurnAgent]:
-    """Open the camera and confirm a burn agent is answering on it."""
-    pipe = open_pipe(product_id or PID_AGENT, wait)
+    """Open the camera and confirm a burn agent — not the boot ROM — is on it."""
+    pipe = open_pipe(product_id, wait)
     agent = BurnAgent(pipe)
-    if not agent.ping():
+    agent.read_greeting()
+    if not agent.is_agent():
         pipe.close()
         raise CliError(
-            "the device is attached but no burn agent answered. If it is still in "
-            "boot ROM mode, run `hisiburn boot -f u-boot.bin` first."
+            "the device is attached but no burn agent answered. Both stages share "
+            "the same USB id, so this is most likely the boot ROM still waiting "
+            "for a download — run `hisiburn boot -f u-boot.bin` first."
         )
-    agent.open_channel()
     return pipe, agent
 
 
@@ -126,7 +125,11 @@ def cmd_probe(args: argparse.Namespace) -> int:
                     f"maxpacket {pipe.ep_in.wMaxPacketSize}"
                 )
                 agent = BurnAgent(pipe)
-                print(f"  burn agent answers ping: {agent.ping()}")
+                greeting = agent.read_greeting()
+                if greeting:
+                    print(f"  greeting: {greeting}")
+                print(f"  answers a sync frame: {agent.ping()}")
+                print(f"  running the burn agent: {agent.is_agent()}")
         except (UsbError, DeviceNotFound) as exc:
             print(f"  could not open: {exc}")
     return 0
@@ -170,28 +173,34 @@ def cmd_boot(args: argparse.Namespace) -> int:
     data = uboot.read_bytes()
     print(f"Loading {uboot.name} ({len(data)} bytes) via the boot ROM...")
 
-    pipe = open_pipe(args.pid or PID_BOOTROM, args.wait)
+    pipe = open_pipe(args.pid, args.wait)
+    previous = pipe.info.location
     try:
         BootRom(pipe).boot_uboot(data, profile, on_progress=ProgressBar("upload"))
     finally:
         pipe.close()
 
-    print("U-Boot started. Waiting for the burn agent to enumerate...")
+    # The loaded U-Boot comes back under the same USB id, so the handoff shows
+    # up as a re-enumeration at a new address rather than a new product id.
+    print("U-Boot started. Waiting for it to re-enumerate...")
     try:
-        device = wait_for_device(PID_AGENT, timeout=15.0)
+        device = wait_for_device(args.pid, timeout=20.0, exclude=previous)
     except DeviceNotFound as exc:
         raise CliError(
-            f"{exc}\nThe images went across but the agent did not come up. "
-            "Check that this U-Boot was built with HiSilicon's usbtftp support."
+            f"{exc}\nThe images went across but nothing came back. Check that this "
+            "U-Boot was built with HiSilicon's usbtftp support."
         ) from exc
 
     with BulkPipe(device) as pipe:
         agent = BurnAgent(pipe)
-        if agent.ping():
-            agent.open_channel()
+        greeting = agent.read_greeting()
+        if greeting:
+            print(f"  {greeting}")
+        if agent.is_agent():
             print(f"Agent ready: {agent.get_info('version')}")
         else:
-            print("Agent enumerated but did not answer a ping.")
+            print("Device re-enumerated but is not answering as a burn agent.")
+            return 1
     return 0
 
 

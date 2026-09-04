@@ -32,7 +32,7 @@ def test_from_log_writes_json_that_flash_can_load(capsys, fixture_log, tmp_path,
     assert main(
         ["flash", "--layout-file", str(layout_path), "-d", str(firmware), "--dry-run"]
     ) == 0
-    assert "sf erase 0xD50000 0x2B0000" in capsys.readouterr().out
+    assert "sf erase 0xd50000 0x2b0000" in capsys.readouterr().out
 
 
 def test_from_log_list_shows_sessions(capsys, fixture_log):

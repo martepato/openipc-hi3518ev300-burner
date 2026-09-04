@@ -48,7 +48,7 @@ class Partition:
 
     def __str__(self) -> str:
         source = self.image or ("staged U-Boot" if self.from_staged_uboot else "erase only")
-        return f"{self.name:<12} 0x{self.offset:08X}  {self.size // 1024:>6} KiB  {source}"
+        return f"{self.name:<12} 0x{self.offset:08x}  {self.size // 1024:>6} KiB  {source}"
 
 
 @dataclass(frozen=True)

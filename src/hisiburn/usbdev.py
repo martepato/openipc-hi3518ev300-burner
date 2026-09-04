@@ -21,19 +21,13 @@ log = logging.getLogger(__name__)
 #: Huawei's vendor id; HiSilicon is a Huawei subsidiary and uses it throughout.
 VENDOR_ID = 0x12D1
 
-#: Product id the mask ROM enumerates with while waiting for a download.
-PID_BOOTROM = 0x3609
+#: The one product id in play. Both stages present it: the boot ROM waiting for
+#: a download and the U-Boot burn agent it starts are indistinguishable by
+#: descriptor — captures of both show byte-identical device and configuration
+#: descriptors. Which one is listening has to be established by asking.
+PRODUCT_ID = 0xD001
 
-#: Product id the U-Boot burn agent enumerates with once it is running.
-PID_AGENT = 0xD001
-
-#: Every product id worth opening, newest role first.
-KNOWN_PRODUCT_IDS = (PID_AGENT, PID_BOOTROM)
-
-ROLE_NAMES = {
-    PID_BOOTROM: "boot ROM (waiting for download)",
-    PID_AGENT: "U-Boot burn agent (ready to flash)",
-}
+KNOWN_PRODUCT_IDS = (PRODUCT_ID,)
 
 DEFAULT_TIMEOUT_MS = 5000
 
@@ -59,15 +53,14 @@ class FoundDevice:
 
     @property
     def role(self) -> str:
-        return ROLE_NAMES.get(self.product_id, "unrecognised HiSilicon device")
+        if self.product_id == PRODUCT_ID:
+            return "HiUSBBurn (boot ROM or burn agent — ask it to tell them apart)"
+        return "unrecognised HiSilicon device"
 
     @property
-    def is_bootrom(self) -> bool:
-        return self.product_id == PID_BOOTROM
-
-    @property
-    def is_agent(self) -> bool:
-        return self.product_id == PID_AGENT
+    def location(self) -> tuple[int | None, int | None]:
+        """Bus and address, which change when the device re-enumerates."""
+        return (self.bus, self.address)
 
     def __str__(self) -> str:
         location = ""
@@ -102,16 +95,24 @@ def list_devices(vendor_id: int = VENDOR_ID) -> list[FoundDevice]:
     return [_describe(dev) for dev in usb.core.find(find_all=True, idVendor=vendor_id)]
 
 
-def find_device(product_id: int | None = None) -> usb.core.Device:
+def find_device(
+    product_id: int | None = None,
+    exclude: tuple[int | None, int | None] | None = None,
+) -> usb.core.Device:
     """Return the raw pyusb handle for an attached camera.
 
-    With ``product_id`` unset, prefers the burn agent over the boot ROM, since
-    a device showing both is one mid-handoff.
+    ``exclude`` skips a device at a given (bus, address), which is how the
+    handoff after stage 1 is detected: the same product id comes back at a new
+    address once the loaded U-Boot re-enumerates.
     """
     wanted = (product_id,) if product_id is not None else KNOWN_PRODUCT_IDS
     for pid in wanted:
-        device = usb.core.find(idVendor=VENDOR_ID, idProduct=pid)
-        if device is not None:
+        for device in usb.core.find(find_all=True, idVendor=VENDOR_ID, idProduct=pid):
+            if exclude is not None and (
+                getattr(device, "bus", None),
+                getattr(device, "address", None),
+            ) == exclude:
+                continue
             return device
     raise DeviceNotFound(
         "no HiSilicon device in USB download mode found "
@@ -124,13 +125,14 @@ def wait_for_device(
     product_id: int | None = None,
     timeout: float = 30.0,
     poll_interval: float = 0.2,
+    exclude: tuple[int | None, int | None] | None = None,
 ) -> usb.core.Device:
     """Poll until the camera shows up, or give up after ``timeout`` seconds."""
     deadline = time.monotonic() + timeout
     last_error: DeviceNotFound | None = None
     while time.monotonic() < deadline:
         try:
-            return find_device(product_id)
+            return find_device(product_id, exclude=exclude)
         except DeviceNotFound as exc:
             last_error = exc
             time.sleep(poll_interval)

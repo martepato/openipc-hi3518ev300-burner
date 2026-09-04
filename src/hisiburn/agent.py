@@ -40,6 +40,29 @@ FLASH_MS_PER_MIB = 12_000
 FLASH_TIMEOUT_FLOOR_MS = 30_000
 
 
+# --- Command text -----------------------------------------------------------
+#
+# These are the exact strings HiBurn sends, lower-case hex included, so a dry
+# run and a real run are formatted by the same code and a capture diff stays
+# clean. `flash.py` renders its preview through them for the same reason.
+
+
+def memset_command(address: int, value: int, length: int) -> str:
+    return f"mw.b 0x{address:x} 0x{value:02X} 0x{length:x}"
+
+
+def probe_command(bus: int = 0) -> str:
+    return f"sf probe {bus}"
+
+
+def erase_command(offset: int, length: int) -> str:
+    return f"sf erase 0x{offset:x} 0x{length:x}"
+
+
+def write_command(address: int, offset: int, length: int) -> str:
+    return f"sf write 0x{address:x} 0x{offset:x} 0x{length:x}"
+
+
 class AgentError(Exception):
     """The agent rejected a frame or answered in a way we cannot continue from."""
 
@@ -72,13 +95,8 @@ class BurnAgent:
 
     def __init__(self, pipe: BulkPipe):
         self.pipe = pipe
-        self._seq = 0
 
     # --- framing helpers ---------------------------------------------------
-
-    def _next_seq(self) -> int:
-        self._seq = (self._seq + 1) & 0xFF
-        return self._seq
 
     def _expect_ack(self, what: str, timeout_ms: int | None = None) -> None:
         status = self.pipe.read_byte(timeout_ms)
@@ -91,18 +109,43 @@ class BurnAgent:
     # --- session -----------------------------------------------------------
 
     def ping(self) -> bool:
-        """Check that an agent is listening. Returns False rather than raising."""
+        """Check that something is listening. Returns False rather than raising.
+
+        A bare ACK does not prove it is the *agent* — the boot ROM answers the
+        same frames. Use :meth:`is_agent` when the distinction matters.
+        """
         try:
-            self.pipe.write(protocol.agent_start_frame())
+            self.pipe.write(protocol.start_frame())
             return self.pipe.read_byte(timeout_ms=2000) == protocol.ACK
         except (UsbError, AgentError) as exc:
             log.debug("ping failed: %s", exc)
             return False
 
-    def open_channel(self) -> None:
-        """Tell the agent to start capturing console output for us."""
-        self.pipe.write(protocol.agent_open_frame())
-        self._expect_ack("channel open")
+    def is_agent(self) -> bool:
+        """Whether a U-Boot burn agent — not the boot ROM — is on the other end.
+
+        Both stages present the same USB descriptors, so the only way to tell
+        them apart is to run a command only U-Boot implements and see whether
+        an ``[EOT]`` comes back.
+        """
+        try:
+            return self.try_command("getinfo version", timeout_ms=3000).ok
+        except (AgentError, UsbError, protocol.IncompleteResponse) as exc:
+            log.debug("agent probe failed: %s", exc)
+            return False
+
+    def read_greeting(self, timeout_ms: int = 1500) -> str | None:
+        """Consume the unsolicited "start download process." the agent sends.
+
+        It arrives once, right after the loaded U-Boot enumerates. Reading it
+        keeps it from being mistaken for the first command's reply.
+        """
+        try:
+            data = self.pipe.read(timeout_ms=timeout_ms)
+        except UsbError:
+            return None
+        text = data.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+        return text or None
 
     # --- commands ----------------------------------------------------------
 
@@ -121,7 +164,7 @@ class BurnAgent:
     ) -> protocol.CommandResult:
         """Run a command and report the outcome without raising on failure."""
         log.debug("send command: %s", command)
-        self.pipe.write(protocol.agent_command_frame(command, self._next_seq()))
+        self.pipe.write(protocol.command_frame(command))
 
         # The reply arrives only once the command has finished running, so a
         # slow erase simply means a long first read. Keep reading in case the
@@ -160,7 +203,12 @@ class BurnAgent:
             raise ValueError("refusing to upload an empty image")
 
         log.debug("upload %d bytes to 0x%08X", len(data), address)
-        self.pipe.write(protocol.agent_head_frame(len(data), address))
+        # HiBurn syncs with a START frame before every upload; the device just
+        # re-arms its OUT endpoint and ACKs.
+        self.pipe.write(protocol.start_frame())
+        self._expect_ack("upload sync")
+
+        self.pipe.write(protocol.head_frame(len(data), address))
         self._expect_ack(f"upload header for 0x{address:08X}")
 
         sent = 0
@@ -175,7 +223,7 @@ class BurnAgent:
             if on_progress:
                 on_progress(sent, len(data))
 
-        self.pipe.write(protocol.agent_tail_frame())
+        self.pipe.write(protocol.tail_frame())
         try:
             self._expect_ack("upload tail")
         except AgentError as exc:
@@ -193,22 +241,20 @@ class BurnAgent:
     def memset(self, address: int, value: int, length: int) -> None:
         """Fill device RAM, used to pad the staging buffer before a short image."""
         self.command(
-            f"mw.b 0x{address:X} 0x{value:02X} 0x{length:X}",
-            timeout_ms=flash_timeout_ms(length),
+            memset_command(address, value, length), timeout_ms=flash_timeout_ms(length)
         )
 
     def flash_probe(self, bus: int = 0) -> str:
-        return self.command(f"sf probe {bus}")
+        return self.command(probe_command(bus))
 
     def flash_erase(self, offset: int, length: int) -> str:
         return self.command(
-            f"sf erase 0x{offset:X} 0x{length:X}", timeout_ms=flash_timeout_ms(length)
+            erase_command(offset, length), timeout_ms=flash_timeout_ms(length)
         )
 
     def flash_write(self, address: int, offset: int, length: int) -> str:
         return self.command(
-            f"sf write 0x{address:X} 0x{offset:X} 0x{length:X}",
-            timeout_ms=flash_timeout_ms(length),
+            write_command(address, offset, length), timeout_ms=flash_timeout_ms(length)
         )
 
     def reset(self) -> None:

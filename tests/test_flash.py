@@ -89,7 +89,7 @@ def test_dry_run_commands_match_the_hiburn_sequence(firmware):
 def test_erase_only_partition_emits_no_write(firmware):
     plan = build_plan(LAYOUT, firmware, only={"rootfs_data"})
     commands = list(plan.commands())
-    assert commands == ["sf probe 0", "sf erase 0xD50000 0x2B0000", "reset"]
+    assert commands == ["sf probe 0", "sf erase 0xd50000 0x2b0000", "reset"]
 
 
 def _record_session(pipe, plan, **kwargs):
@@ -106,7 +106,7 @@ def _record_session(pipe, plan, **kwargs):
 def test_run_plan_issues_the_expected_commands(firmware, pipe):
     plan = build_plan(LAYOUT, firmware, only={"env"})
     pipe.queue_command_ok()  # mw.b
-    pipe.queue_ack(2)  # upload header and tail
+    pipe.queue_ack(3)  # upload sync, header and tail
     pipe.queue_command_ok()  # sf probe
     pipe.queue_command_ok()  # sf erase
     pipe.queue_command_ok()  # sf write
@@ -122,7 +122,7 @@ def test_run_plan_issues_the_expected_commands(firmware, pipe):
 def test_run_plan_uploads_the_image_bytes(firmware, pipe):
     plan = build_plan(LAYOUT, firmware, only={"env"})
     pipe.queue_command_ok()
-    pipe.queue_ack(2)
+    pipe.queue_ack(3)
     for _ in range(3):
         pipe.queue_command_ok()
 

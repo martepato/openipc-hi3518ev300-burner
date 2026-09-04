@@ -1,114 +1,209 @@
-"""Frame layouts, checked against the field offsets the device reads."""
+"""Frame layouts, asserted against bytes captured from a real HiBurn flash.
+
+``tests/fixtures/captured_frames.json`` holds frames lifted verbatim from a
+USBPcap recording of HiBurn 5.3 flashing a Hi3518EV300. Every builder here is
+checked to produce the same bytes the vendor tool put on the wire.
+"""
+
+import json
+from pathlib import Path
 
 import pytest
 
 from hisiburn import protocol
-from hisiburn.crc import check_crc
+
+CAPTURED = json.loads((Path(__file__).parent / "fixtures" / "captured_frames.json").read_text())
+STAGE1 = CAPTURED["stage1"]
+STAGE2 = CAPTURED["stage2"]
 
 
-def test_bootrom_file_frame_layout():
-    frame = protocol.bootrom_file_frame(protocol.FILE_RAMINIT, 0x40, 0x04013000)
-    assert len(frame) == 14
-    assert frame[0] == protocol.FRAME_FILE
-    assert (frame[1], frame[2]) == (0x00, 0xFF)  # SEQ and its complement
-    assert frame[3] == protocol.FILE_RAMINIT
-    assert frame[4:8] == (0x40).to_bytes(4, "big")
-    assert frame[8:12] == (0x04013000).to_bytes(4, "big")
-    assert check_crc(frame)
+def hexb(text: str) -> bytes:
+    return bytes.fromhex(text)
 
 
-def test_bootrom_file_frame_matches_defib_head_magic():
-    # OpenIPC's defib drives the same boot ROM over UART and opens a transfer
-    # with FE 00 FF 01. That is this frame with sequence 0 and file type 1, so
-    # a change to either field would break compatibility with a known-good
-    # implementation.
-    frame = protocol.bootrom_file_frame(protocol.FILE_RAMINIT, 0x40, 0x04013000)
-    assert frame[0:4] == bytes.fromhex("fe00ff01")
+# --- captured descriptors ---------------------------------------------------
 
 
-def test_bootrom_data_frame_layout():
-    frame = protocol.bootrom_data_frame(b"\xaa" * 16, seq=3)
-    assert frame[0] == protocol.FRAME_DATA
-    assert (frame[1], frame[2]) == (0x03, 0xFC)
-    assert frame[3:19] == b"\xaa" * 16
-    assert check_crc(frame)
+def test_captured_device_is_the_id_we_look_for():
+    from hisiburn.usbdev import PRODUCT_ID, VENDOR_ID
+
+    descriptor = hexb(STAGE2["descriptor"]["device"])
+    assert int.from_bytes(descriptor[8:10], "little") == VENDOR_ID
+    assert int.from_bytes(descriptor[10:12], "little") == PRODUCT_ID
 
 
-def test_bootrom_data_frame_rejects_oversized_payload():
-    with pytest.raises(ValueError, match="frame limit"):
-        protocol.bootrom_data_frame(b"\x00" * (protocol.MAX_DATA_LEN + 1), seq=1)
+def test_captured_interface_is_vendor_specific_with_two_bulk_endpoints():
+    config = hexb(STAGE2["descriptor"]["configuration"])
+    interface = config[9:18]
+    assert interface[5] == 0xFF, "bInterfaceClass must be vendor-specific"
+    assert interface[4] == 2, "two endpoints"
+    ep_in, ep_out = config[18:25], config[25:32]
+    assert (ep_in[2], ep_out[2]) == (0x81, 0x01)
+    assert ep_in[3] == ep_out[3] == 0x02, "both bulk"
+    assert int.from_bytes(ep_out[4:6], "little") == protocol.MAX_PACKET
 
 
-def test_bootrom_eot_frame_layout():
-    frame = protocol.bootrom_eot_frame(seq=7)
-    assert len(frame) == 5
-    assert frame[0] == protocol.FRAME_EOT
-    assert (frame[1], frame[2]) == (0x07, 0xF8)
-    assert check_crc(frame)
+# --- frames shared by both stages ------------------------------------------
 
 
-def test_sequence_wraps_at_a_byte():
-    frame = protocol.bootrom_eot_frame(seq=256)
-    assert (frame[1], frame[2]) == (0x00, 0xFF)
+def test_head_frame_matches_every_captured_header():
+    for head in STAGE1["heads"] + STAGE2["heads"]:
+        assert protocol.head_frame(head["length"], head["address"]) == hexb(head["frame"])
 
 
-def test_chunk_splits_to_the_frame_limit():
-    pieces = protocol.chunk(b"x" * 2500)
-    assert [len(p) for p in pieces] == [1024, 1024, 452]
-
-
-def test_agent_head_frame_layout():
-    # The device reads length from bytes 1..4 and address from bytes 5..8.
-    frame = protocol.agent_head_frame(0x10000, 0x41000000)
-    assert frame[0] == protocol.UHEAD
+def test_head_frame_is_nine_bytes_big_endian():
+    frame = protocol.head_frame(0x10000, 0x41000000)
+    assert len(frame) == 9
+    assert frame[0] == protocol.OP_HEAD
     assert frame[1:5] == (0x10000).to_bytes(4, "big")
     assert frame[5:9] == (0x41000000).to_bytes(4, "big")
+
+
+def test_head_frame_refuses_the_channel_open_shape():
+    with pytest.raises(ValueError, match="channel-open"):
+        protocol.head_frame(0x1234, 0x1234)
+
+
+def test_open_frame_matches_the_captured_one():
+    captured = hexb(STAGE1["open_frame"])
+    token = int.from_bytes(captured[1:5], "big")
+    assert protocol.open_frame(token) == captured
+
+
+def test_open_frame_repeats_its_token():
+    frame = protocol.open_frame(0xCB10A08B)
+    assert frame[0] == protocol.OP_HEAD
+    assert frame[1:5] == frame[5:9]
     assert len(frame) == 9
 
 
-def test_agent_head_frame_refuses_the_channel_open_form():
-    # length == address makes the device open its output channel instead of
-    # receiving data, which would silently swallow the upload.
-    with pytest.raises(ValueError, match="channel-open"):
-        protocol.agent_head_frame(0x1234, 0x1234)
+def test_start_frame_matches_the_captured_ones():
+    for captured_hex in STAGE2["start_frames"]:
+        captured = hexb(captured_hex)
+        token = int.from_bytes(captured[1:5], "big")
+        assert protocol.start_frame(token) == captured
 
 
-def test_agent_open_frame_uses_equal_length_and_address():
-    frame = protocol.agent_open_frame()
-    assert frame[0] == protocol.UHEAD
+def test_start_frame_shape():
+    frame = protocol.start_frame(0x6A9B2567)
+    assert frame[0] == protocol.OP_START
     assert frame[1:5] == frame[5:9]
+    assert len(frame) == 9
 
 
-def test_agent_command_frame_puts_text_at_offset_three():
-    # The device runs everything from buf+3 through run_command().
-    frame = protocol.agent_command_frame("sf probe 0")
-    assert frame[0] == protocol.UCMD
-    assert frame[3:] == b"sf probe 0\x00"
+def test_tail_frame_is_a_bare_opcode():
+    assert protocol.tail_frame() == hexb(STAGE1["tail_frame"])
+    assert protocol.tail_frame() == hexb(STAGE2["tail_frame"])
+    assert protocol.tail_frame() == b"\xed"
 
 
-def test_agent_command_frame_rejects_embedded_nul():
+# --- boot ROM data framing --------------------------------------------------
+
+
+def test_data_frame_matches_the_captured_ddr_frame():
+    assert protocol.data_frame(hexb(STAGE1["ddr_blob"])) == hexb(STAGE1["ddr_data_frame"])
+
+
+def test_data_frame_has_no_sequence_or_checksum():
+    # An earlier reading of the vendor headers assumed SEQ/~SEQ and a CRC here.
+    # The capture shows the payload starting immediately after the opcode.
+    payload = b"\xa5" * 64
+    frame = protocol.data_frame(payload)
+    assert frame == b"\xda" + payload
+    assert len(frame) == len(payload) + 1
+
+
+def test_captured_data_frames_never_exceed_one_max_packet():
+    assert STAGE1["max_data_payload"] == protocol.MAX_DATA_PAYLOAD == 511
+
+
+def test_data_frame_rejects_an_oversized_payload():
+    with pytest.raises(ValueError, match="frame limit"):
+        protocol.data_frame(b"\x00" * (protocol.MAX_DATA_PAYLOAD + 1))
+
+
+def test_data_frame_rejects_an_empty_payload():
+    with pytest.raises(ValueError, match="empty"):
+        protocol.data_frame(b"")
+
+
+def test_chunk_splits_at_the_frame_limit():
+    pieces = protocol.chunk(b"x" * 1200)
+    assert [len(p) for p in pieces] == [511, 511, 178]
+
+
+def test_chunking_reproduces_the_captured_frame_sizes():
+    # The SPL upload: 0x6000 bytes became 48 full frames and a 48-byte tail.
+    sizes = [len(p) for p in protocol.chunk(b"\x00" * 0x6000)]
+    assert sizes == [511] * 48 + [48]
+    assert sizes == STAGE1["data_frame_payload_sizes"][1 : 1 + len(sizes)]
+
+
+# --- burn agent commands ----------------------------------------------------
+
+
+def test_command_frame_matches_every_captured_command():
+    for entry in STAGE2["commands"]:
+        assert protocol.command_frame(entry["text"]) == hexb(entry["frame"])
+
+
+def test_command_frame_carries_a_big_endian_length_not_a_sequence():
+    frame = protocol.command_frame("sf probe 0")
+    assert frame[0] == protocol.OP_CMD
+    assert int.from_bytes(frame[1:3], "big") == len("sf probe 0")
+    assert frame[3:] == b"sf probe 0"
+
+
+def test_command_frame_is_not_nul_terminated():
+    # The device zeroes its receive buffer before every packet, so the
+    # terminator is already in place; HiBurn sends none.
+    assert not protocol.command_frame("reset").endswith(b"\x00")
+
+
+def test_command_frame_rejects_embedded_nul():
     with pytest.raises(ValueError, match="NUL"):
-        protocol.agent_command_frame("sf probe\x000")
+        protocol.command_frame("sf probe\x000")
 
 
-def test_parse_success_response():
-    raw = b"version: U-Boot 2016.11-g131d3f2\r\n[EOT](OK)\r\n\x00\x00\x00"
-    result = protocol.parse_command_response("getinfo version", raw)
-    assert result.ok
-    assert result.output == "version: U-Boot 2016.11-g131d3f2"
-    assert bool(result) is True
+def test_captured_commands_are_the_ones_we_generate():
+    texts = [entry["text"] for entry in STAGE2["commands"]]
+    assert "getinfo version" in texts
+    assert "sf probe 0" in texts
+    assert "mw.b 0x41000000 0xFF 0x10000" in texts
+    assert "sf write 0x41000000 0x40000 0x10000" in texts
+    assert "reset" in texts
+
+
+# --- responses --------------------------------------------------------------
+
+
+def test_captured_ack_is_two_bytes():
+    # usb3_bulk_in_transfer sends strlen(s) + 1, so an ACK arrives NUL-padded.
+    ack = hexb(STAGE1["ack"])
+    assert ack[0] == protocol.ACK
+    assert len(ack) == 2
+
+
+def test_parses_the_captured_responses():
+    parsed = [
+        protocol.parse_command_response("x", hexb(h))
+        for h in STAGE2["responses"]
+        if protocol.response_is_complete(hexb(h))
+    ]
+    assert parsed, "capture should contain at least one complete reply"
+    assert all(result.ok for result in parsed)
+    assert any("U-Boot 2016.11" in result.output for result in parsed)
+
+
+def test_leading_space_from_the_device_is_stripped():
+    result = protocol.parse_command_response("getinfo bootmode", b" spi\n[EOT](OK)\r\n\x00")
+    assert result.output == "spi"
 
 
 def test_parse_error_response():
     result = protocol.parse_command_response("bogus", b"Unknown command\r\n[EOT](ERROR)\r\n")
     assert not result.ok
     assert "Unknown command" in result.output
-
-
-def test_parse_response_with_no_output():
-    result = protocol.parse_command_response("sf probe 0", b" [EOT](OK)\r\n\x00")
-    assert result.ok
-    assert result.output == ""
 
 
 def test_parse_rejects_a_truncated_response():
@@ -119,5 +214,10 @@ def test_parse_rejects_a_truncated_response():
 def test_response_completeness_check():
     assert not protocol.response_is_complete(b"Erasing at 0x10000 -- 25%")
     assert protocol.response_is_complete(b"Erasing done[EOT](OK)\r\n")
-    # Padding past the terminator must not be mistaken for more output.
     assert not protocol.response_is_complete(b"\x00[EOT](OK)")
+
+
+def test_zero_length_reply_is_not_complete():
+    # Long-running commands make the device answer with empty packets until
+    # the command finishes; those must not be mistaken for a reply.
+    assert not protocol.response_is_complete(b"")

@@ -1,63 +1,107 @@
-"""Boot ROM staging, driven against a recorded pipe."""
+"""Boot ROM staging, checked against the captured HiBurn session."""
+
+import json
+from pathlib import Path
 
 import pytest
 
 from hisiburn import protocol
-from hisiburn.bootrom import HI3518EV300, BootRom, BootRomError, ChipProfile, detect_spl_size
+from hisiburn.bootrom import (
+    HI3518EV300,
+    START_MAGIC,
+    START_MAGIC_OFFSET,
+    BootRom,
+    BootRomError,
+    ChipProfile,
+)
+
+CAPTURED = json.loads((Path(__file__).parent / "fixtures" / "captured_frames.json").read_text())
+STAGE1 = CAPTURED["stage1"]
 
 
-def test_profile_load_addresses():
-    # These match the hi3518ev300 profile OpenIPC's defib drives over UART.
-    assert HI3518EV300.ddr_address == 0x04013000
-    assert HI3518EV300.spl_address == 0x04010500
-    assert HI3518EV300.uboot_address == 0x41000000
-    assert len(HI3518EV300.ddr_init) == 64
+def test_ddr_stub_is_the_captured_one():
+    assert HI3518EV300.ddr_init == bytes.fromhex(STAGE1["ddr_blob"])
 
 
-def test_profile_rejects_a_wrong_sized_ddr_blob():
-    with pytest.raises(ValueError, match="64 bytes"):
+def test_ddr_stub_carries_the_download_magic():
+    # The stub stores this to REG_START_FLAG (0x1202013C). download_boot() in
+    # the U-Boot it loads checks for exactly this before entering the download
+    # loop, so a stub without it boots the camera normally instead.
+    word = HI3518EV300.ddr_init[START_MAGIC_OFFSET : START_MAGIC_OFFSET + 4]
+    assert int.from_bytes(word, "little") == START_MAGIC == 0x444F574E
+    assert word == b"NWOD", "little-endian 'DOWN'"
+
+
+def test_profile_rejects_a_stub_without_the_download_magic():
+    # A UART-derived profile has a different word here; catching that at
+    # construction beats a camera that silently boots instead of flashing.
+    stub = bytearray(HI3518EV300.ddr_init)
+    stub[START_MAGIC_OFFSET : START_MAGIC_OFFSET + 4] = (0x12345678).to_bytes(4, "little")
+    with pytest.raises(ValueError, match="START_MAGIC"):
         ChipProfile(
-            name="bad",
-            ddr_init=b"\x00" * 32,
-            ddr_address=0,
-            spl_address=0,
-            uboot_address=0,
-            spl_max_size=0x1000,
+            name="bad", ddr_init=bytes(stub), ddr_address=0, spl_address=0,
+            spl_size=0x6000, uboot_address=0,
         )
 
 
-def test_send_image_frames_a_transfer(pipe):
-    pipe.queue_ack(3)  # FILE, one DATA, EOT
-    BootRom(pipe).send_image(b"\xa5" * 512, 0x04013000)
+def test_profile_rejects_a_wrong_sized_stub():
+    with pytest.raises(ValueError, match="64 bytes"):
+        ChipProfile(
+            name="bad", ddr_init=b"\x00" * 32, ddr_address=0, spl_address=0,
+            spl_size=0x6000, uboot_address=0,
+        )
 
-    file_frame, data_frame, eot_frame = pipe.writes
-    assert file_frame == protocol.bootrom_file_frame(protocol.FILE_RAMINIT, 512, 0x04013000)
-    assert data_frame[0] == protocol.FRAME_DATA
-    assert data_frame[3:-2] == b"\xa5" * 512
-    assert eot_frame[0] == protocol.FRAME_EOT
+
+def test_profile_addresses_match_the_capture():
+    lengths_and_addresses = [(h["length"], h["address"]) for h in STAGE1["heads"]]
+    assert lengths_and_addresses[0] == (len(HI3518EV300.ddr_init), HI3518EV300.ddr_address)
+    assert lengths_and_addresses[1] == (HI3518EV300.spl_size, HI3518EV300.spl_address)
+    assert lengths_and_addresses[2][1] == HI3518EV300.uboot_address
+
+
+def test_open_session_sends_the_open_frame(pipe):
+    pipe.queue_ack()
+    BootRom(pipe).open_session(0xCB10A08B)
+    assert pipe.writes == [bytes.fromhex(STAGE1["open_frame"])]
+
+
+def test_send_image_frames_a_transfer(pipe):
+    pipe.queue_ack(2)  # header and tail only
+    BootRom(pipe).send_image(b"\xa5" * 300, 0x04013000)
+
+    head, data, tail = pipe.writes
+    assert head == protocol.head_frame(300, 0x04013000)
+    assert data == b"\xda" + b"\xa5" * 300
+    assert tail == b"\xed"
+
+
+def test_data_frames_are_not_individually_acknowledged(pipe):
+    # The capture shows exactly two replies per image: one for the header and
+    # one for the tail. Waiting on each DATA frame would deadlock.
+    pipe.queue_ack(2)
+    BootRom(pipe).send_image(b"\x00" * (511 * 5), 0x41000000)
+    assert len(pipe.replies) == 0
+    assert sum(1 for w in pipe.writes if w[0] == protocol.OP_DATA) == 5
 
 
 def test_send_image_splits_at_the_frame_limit(pipe):
-    pipe.queue_ack(5)  # FILE, three DATA, EOT
-    BootRom(pipe).send_image(b"\x00" * 2500, 0x41000000)
-    payloads = [frame[3:-2] for frame in pipe.writes if frame[0] == protocol.FRAME_DATA]
-    assert [len(p) for p in payloads] == [1024, 1024, 452]
+    pipe.queue_ack(2)
+    BootRom(pipe).send_image(b"\x00" * 0x6000, 0x04010500)
+    payloads = [len(w) - 1 for w in pipe.writes if w[0] == protocol.OP_DATA]
+    assert payloads == STAGE1["data_frame_payload_sizes"][1 : 1 + len(payloads)]
 
 
-def test_data_frame_sequence_increments(pipe):
-    pipe.queue_ack(4)
-    BootRom(pipe).send_image(b"\x00" * 2048, 0x41000000)
-    sequences = [frame[1] for frame in pipe.writes if frame[0] == protocol.FRAME_DATA]
-    assert sequences == [1, 2]
+def test_send_image_rejects_an_empty_image(pipe):
+    with pytest.raises(ValueError, match="empty image"):
+        BootRom(pipe).send_image(b"", 0x41000000)
 
 
-def test_a_naked_frame_is_resent(pipe):
-    pipe.queue(b"\x55")  # NAK the header once
-    pipe.queue_ack(3)
+def test_a_naked_header_is_resent(pipe):
+    pipe.queue(b"\x55")
+    pipe.queue_ack(2)
     BootRom(pipe).send_image(b"\x00" * 16, 0x41000000)
-    headers = [f for f in pipe.writes if f[0] == protocol.FRAME_FILE]
-    assert len(headers) == 2, "the header should have been sent twice"
-    assert headers[0] == headers[1]
+    headers = [w for w in pipe.writes if w[0] == protocol.OP_HEAD]
+    assert len(headers) == 2 and headers[0] == headers[1]
 
 
 def test_giving_up_reports_the_last_answer(pipe):
@@ -66,44 +110,48 @@ def test_giving_up_reports_the_last_answer(pipe):
         BootRom(pipe).send_image(b"\x00" * 16, 0x41000000)
 
 
-def test_detect_spl_size_finds_a_gzip_payload():
-    uboot = bytearray(b"\x00" * 0x8000)
-    uboot[0x5000:0x5003] = b"\x1f\x8b\x08"
-    assert detect_spl_size(bytes(uboot), HI3518EV300) == 0x5000
-
-
-def test_detect_spl_size_finds_an_lzma_payload():
-    uboot = bytearray(b"\x00" * 0x8000)
-    uboot[0x4800] = 0x5D
-    uboot[0x4801:0x4805] = (1 << 20).to_bytes(4, "little")
-    assert detect_spl_size(bytes(uboot), HI3518EV300) == 0x4800
-
-
-def test_detect_spl_size_ignores_an_implausible_lzma_dictionary():
-    uboot = bytearray(b"\x00" * 0x8000)
-    uboot[0x4800] = 0x5D
-    uboot[0x4801:0x4805] = (12345).to_bytes(4, "little")
-    assert detect_spl_size(bytes(uboot), HI3518EV300) == HI3518EV300.spl_max_size
-
-
-def test_detect_spl_size_falls_back_to_the_profile_maximum():
-    assert detect_spl_size(b"\x00" * 0x8000, HI3518EV300) == HI3518EV300.spl_max_size
-
-
-def test_boot_uboot_stages_ddr_then_spl_then_uboot(pipe):
-    uboot = bytearray(b"\x00" * 0x8000)
-    uboot[0x5000:0x5003] = b"\x1f\x8b\x08"
-    uboot = bytes(uboot)
-
+def test_boot_uboot_reproduces_the_captured_sequence(pipe):
+    uboot = bytes(range(256)) * 923  # 236,288 bytes, past the SPL window
     pipe.queue_ack(200)
     BootRom(pipe).boot_uboot(uboot, HI3518EV300)
 
-    headers = [f for f in pipe.writes if f[0] == protocol.FRAME_FILE and len(f) == 14]
-    addresses = [int.from_bytes(f[8:12], "big") for f in headers]
-    lengths = [int.from_bytes(f[4:8], "big") for f in headers]
-    file_types = [f[3] for f in headers]
+    headers = [w for w in pipe.writes if w[0] == protocol.OP_HEAD and len(w) == 9]
+    opens = [h for h in headers if h[1:5] == h[5:9]]
+    transfers = [
+        (int.from_bytes(h[1:5], "big"), int.from_bytes(h[5:9], "big"))
+        for h in headers
+        if h[1:5] != h[5:9]
+    ]
 
-    assert addresses == [0x04013000, 0x04010500, 0x41000000]
-    assert lengths == [64, 0x5000, len(uboot)]
-    # The final image is announced as the USB payload rather than RAM init.
-    assert file_types == [protocol.FILE_RAMINIT, protocol.FILE_RAMINIT, protocol.FILE_USB]
+    assert len(opens) == 1, "one session-open frame, sent first"
+    assert pipe.writes[0] == opens[0]
+    assert transfers == [
+        (64, 0x04013000),
+        (0x6000, 0x04010500),
+        (len(uboot), 0x41000000),
+    ]
+
+
+def test_spl_is_the_front_of_the_uboot_image(pipe):
+    # Verified against the capture: the SPL upload is byte-identical to the
+    # first 0x6000 bytes of the U-Boot image sent afterwards.
+    uboot = bytes(range(256)) * 923
+    pipe.queue_ack(200)
+    BootRom(pipe).boot_uboot(uboot, HI3518EV300)
+
+    images, current = {}, None
+    for frame in pipe.writes:
+        if frame[0] == protocol.OP_HEAD and frame[1:5] != frame[5:9]:
+            current = int.from_bytes(frame[5:9], "big")
+            images[current] = bytearray()
+        elif frame[0] == protocol.OP_DATA and current is not None:
+            images[current] += frame[1:]
+
+    assert bytes(images[HI3518EV300.spl_address]) == uboot[: HI3518EV300.spl_size]
+    assert bytes(images[HI3518EV300.uboot_address]) == uboot
+    assert bytes(images[HI3518EV300.ddr_address]) == HI3518EV300.ddr_init
+
+
+def test_boot_uboot_rejects_an_image_shorter_than_the_spl_window(pipe):
+    with pytest.raises(BootRomError, match="shorter than"):
+        BootRom(pipe).boot_uboot(b"\x00" * 0x1000, HI3518EV300)

@@ -9,7 +9,8 @@ from hisiburn.agent import AgentError, BurnAgent, CommandFailed, flash_timeout_m
 def test_ping_accepts_an_ack(pipe):
     pipe.queue_ack()
     assert BurnAgent(pipe).ping()
-    assert pipe.writes == [protocol.agent_start_frame()]
+    assert pipe.writes[0][0] == protocol.OP_START
+    assert len(pipe.writes[0]) == 9
 
 
 def test_ping_reports_silence_rather_than_raising(pipe):
@@ -17,31 +18,43 @@ def test_ping_reports_silence_rather_than_raising(pipe):
     assert not BurnAgent(pipe).ping()
 
 
-def test_open_channel_sends_the_equal_length_form(pipe):
-    pipe.queue_ack()
-    BurnAgent(pipe).open_channel()
-    frame = pipe.writes[0]
-    assert frame[0] == protocol.UHEAD
-    assert frame[1:5] == frame[5:9]
+def test_is_agent_distinguishes_the_agent_from_the_boot_rom(pipe):
+    # Both stages present identical USB descriptors, so the only way to tell
+    # them apart is whether a U-Boot command comes back with an [EOT].
+    pipe.queue_command_ok("version: U-Boot 2016.11-g131d3f2\r\n")
+    assert BurnAgent(pipe).is_agent()
 
 
-def test_open_channel_raises_on_nak(pipe):
+def test_is_agent_is_false_when_nothing_answers(pipe):
+    assert not BurnAgent(pipe).is_agent()
+
+
+def test_read_greeting_returns_the_download_banner(pipe):
+    pipe.queue(b"start download process.\x00")
+    assert BurnAgent(pipe).read_greeting() == "start download process."
+
+
+def test_read_greeting_tolerates_silence(pipe):
+    assert BurnAgent(pipe).read_greeting() is None
+
+
+def test_upload_nak_is_reported(pipe):
     pipe.queue(b"\x55")
     with pytest.raises(AgentError, match="NAKed"):
-        BurnAgent(pipe).open_channel()
+        BurnAgent(pipe).upload(b"x" * 16, 0x41000000)
 
 
 def test_unexpected_status_byte_is_reported(pipe):
     pipe.queue(b"\x42")
     with pytest.raises(AgentError, match="0x42"):
-        BurnAgent(pipe).open_channel()
+        BurnAgent(pipe).upload(b"x" * 16, 0x41000000)
 
 
 def test_command_returns_output(pipe):
     pipe.queue_command_ok("version: U-Boot 2016.11-g131d3f2\r\n")
     agent = BurnAgent(pipe)
     assert agent.command("getinfo version") == "version: U-Boot 2016.11-g131d3f2"
-    assert pipe.writes[0][3:] == b"getinfo version\x00"
+    assert pipe.writes[0] == protocol.command_frame("getinfo version")
 
 
 def test_command_failure_explains_the_stuck_agent(pipe):
@@ -62,37 +75,40 @@ def test_reply_split_across_packets_is_reassembled(pipe):
     assert "Erasing" in BurnAgent(pipe).command("sf erase 0x0 0x40000")
 
 
-def test_sequence_number_advances_per_command(pipe):
+def test_repeated_commands_send_identical_frames(pipe):
+    # The frame carries a length, not a sequence number, so the same command
+    # is the same bytes every time -- as the capture shows.
     pipe.queue_command_ok()
     pipe.queue_command_ok()
     agent = BurnAgent(pipe)
     agent.command("sf probe 0")
     agent.command("sf probe 0")
-    assert pipe.writes[0][1] != pipe.writes[1][1]
+    assert pipe.writes[0] == pipe.writes[1]
 
 
-def test_upload_sends_header_payload_and_tail(pipe):
-    pipe.queue_ack(2)  # header, then tail
+def test_upload_sends_sync_header_payload_and_tail(pipe):
+    pipe.queue_ack(3)  # sync, header, then tail
     payload = b"\xa5" * 4096
     BurnAgent(pipe).upload(payload, 0x41000000)
 
-    header, body, tail = pipe.writes
-    assert header == protocol.agent_head_frame(len(payload), 0x41000000)
-    assert body == payload
-    assert tail == protocol.agent_tail_frame()
+    sync, header, body, tail = pipe.writes
+    assert sync[0] == protocol.OP_START and len(sync) == 9
+    assert header == protocol.head_frame(len(payload), 0x41000000)
+    assert body == payload, "the agent takes uploads raw, with no DATA framing"
+    assert tail == protocol.tail_frame()
 
 
 def test_upload_chunks_large_images(pipe):
-    pipe.queue_ack(2)
+    pipe.queue_ack(3)
     payload = b"\x00" * (200 * 1024)
     BurnAgent(pipe).upload(payload, 0x41000000)
-    body = b"".join(pipe.writes[1:-1])
+    body = b"".join(pipe.writes[2:-1])
     assert body == payload
     assert len(pipe.writes) > 3, "a 200 KiB image should be streamed in several writes"
 
 
 def test_upload_reports_progress(pipe):
-    pipe.queue_ack(2)
+    pipe.queue_ack(3)
     seen: list[tuple[int, int]] = []
     payload = b"\x00" * (128 * 1024)
     BurnAgent(pipe).upload(payload, 0x41000000, on_progress=lambda s, t: seen.append((s, t)))
@@ -105,7 +121,7 @@ def test_upload_rejects_an_empty_image(pipe):
 
 
 def test_upload_tail_nak_says_the_image_is_incomplete(pipe):
-    pipe.queue_ack()
+    pipe.queue_ack(2)
     pipe.queue(b"\x55")
     with pytest.raises(AgentError, match="did not land completely"):
         BurnAgent(pipe).upload(b"x" * 16, 0x41000000)
@@ -120,7 +136,7 @@ def test_convenience_wrappers_emit_hiburn_command_text(pipe):
     agent.flash_erase(0x40000, 0x10000)
     agent.flash_write(0x41000000, 0x40000, 0x10000)
 
-    sent = [frame[3:].rstrip(b"\x00").decode() for frame in pipe.writes]
+    sent = [frame[3:].decode() for frame in pipe.writes]
     assert sent == [
         "mw.b 0x41000000 0xFF 0x10000",
         "sf probe 0",

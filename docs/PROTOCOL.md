@@ -1,38 +1,41 @@
 # The HiSilicon USB flashing protocol
 
-This is what HiTool/HiBurn does over USB, written down. Everything here is
-derived from HiSilicon's own GPL-licensed U-Boot sources — the ones OpenIPC
-ships in [`u-boot-hi3516ev200`][uboot] — cross-checked against a real HiBurn
-session log and against OpenIPC's [`defib`][defib], which drives the same boot
-ROM over UART.
+This is what HiTool/HiBurn does over USB, written down.
+
+Everything here is **verified against a USBPcap capture of a successful
+HiBurn 5.3 flash** of a Hi3518EV300 (Xiaomi MJSXJ02HL), cross-read against
+HiSilicon's own GPL U-Boot sources as shipped in OpenIPC's
+[`u-boot-hi3516ev200`][uboot]. The frames quoted below are bytes that were
+actually on the wire; `tests/fixtures/captured_frames.json` holds them and the
+test suite asserts this implementation reproduces them exactly.
 
 [uboot]: https://github.com/OpenIPC/u-boot-hi3516ev200
-[defib]: https://github.com/OpenIPC/defib
 
 ## Overview
 
-Flashing is two stages, and each stage speaks a *different* protocol over the
-same pair of bulk endpoints:
+Flashing is two stages. Both present **the same USB identity** and share most
+of their framing, but they are different programs with different capabilities:
 
-| Stage | Who is running | USB id | What it does |
-|---|---|---|---|
-| 1 | mask ROM | `12d1:3609` | accepts CRC-checked frames into SRAM/DDR; starts U-Boot |
-| 2 | U-Boot burn agent | `12d1:d001` | raw DMA into RAM + U-Boot console commands |
+| Stage | Who is running | What it does |
+|---|---|---|
+| 1 | boot ROM | takes three images into SRAM/DDR, then starts U-Boot |
+| 2 | U-Boot burn agent | raw uploads into RAM + U-Boot console commands |
 
-The camera enters stage 1 when the reset button is held as USB power is
-applied. Once stage 1 has loaded and started a U-Boot built with HiSilicon's
-`usbtftp` support, that U-Boot re-enumerates and stage 2 begins.
+Between them the device re-enumerates: same vendor and product id, new bus
+address. There is no descriptor difference to key off — telling the two apart
+means asking (see [Distinguishing the stages](#distinguishing-the-stages)).
 
 ## USB identity
 
-From `drivers/usb/gadget/hiudc3/usb3_pcd.c` and `usb3.h`:
+Captured device and configuration descriptors:
 
 ```
 idVendor          0x12D1   (Huawei; HiSilicon is a Huawei subsidiary)
-idProduct         0xD001   (burn agent)   — 0x3609 is the boot ROM
-bInterfaceClass   0xFF     vendor-specific
+idProduct         0xD001   — both stages
+bcdUSB            0x0200
+bInterfaceClass   0xFF     vendor-specific  (subclass 0xFF, protocol 0xFF)
 bNumEndpoints     2        bulk IN 0x81, bulk OUT 0x01
-wMaxPacketSize    512 (high speed) / 1024 (super speed)
+wMaxPacketSize    512
 iManufacturer     "Hisilicon"
 iProduct          "HiUSBBurn"
 ```
@@ -42,129 +45,158 @@ no stock Windows driver binds a `0xFF` interface, so libusbK has to be
 installed against the device. macOS and Linux need nothing — no kernel driver
 claims a vendor-specific interface, so libusb can open it directly.
 
-## Checksum
+> `usb3.h` in the vendor tree carries a commented-out `0x3609` next to the
+> product id. It is not what the silicon enumerates with; the capture shows
+> `0xD001` for the boot ROM as well as the agent.
 
-Both stage-1 framing and the serial fallback use one CRC, transcribed from
-`calc_crc16()` in `common/download_process.c`:
+## Framing
 
-```c
-for (i = 0; i < length; i++)
-    crc = ((crc << 8) | packet[i]) ^ table[(crc >> 8) & 0xFF];
-for (i = 0; i < 2; i++)                       /* flush */
-    crc = ((crc << 8) | 0)         ^ table[(crc >> 8) & 0xFF];
-```
+All multi-byte fields are **big-endian**. There is **no checksum and no
+sequence number anywhere in the USB protocol**.
 
-The table is the standard CCITT one (polynomial `0x1021`), but the update step
-is **not** standard CRC-16/CCITT: the message byte is shifted into the low half
-of the register rather than XORed into the high half. A stock CRC routine
-produces frames the device silently NAKs. See `hisiburn/crc.py`.
+> The vendor header `usb3_prot.h` documents a `TYPE SEQ ~SEQ … CRC` layout,
+> and OpenIPC's `defib` implements exactly that. **That is the UART protocol.**
+> Reading it as the USB one produces frames this device ignores. The USB
+> framing is the simpler thing below.
 
-Checksums are transmitted big-endian, as is every multi-byte field below.
-
-## Stage 1 — the mask ROM
-
-Frame layouts are documented in `drivers/usb/gadget/hiudc3/usb3_prot.h`:
-
-```
-FILE FRAME: TYPE(1) SEQ(1) ~SEQ(1) FILE(1) LENGTH(4) ADDRESS(4) CRC(2)   14 bytes
-DATA FRAME: TYPE(1) SEQ(1) ~SEQ(1) DATA(0..1024)     CRC(2)
-EOT  FRAME: TYPE(1) SEQ(1) ~SEQ(1) CRC(2)                                 5 bytes
-```
-
-| Constant | Value |
-|---|---|
-| `FRAME_FILE` | `0xFE` |
-| `FRAME_DATA` | `0xDA` |
-| `FRAME_EOT` | `0xED` |
-| `FRAME_INQUIRE` | `0xCD` |
-| `FILE_RAMINIT` | `1` |
-| `FILE_USB` | `2` |
-| ACK / NAK | `0xAA` / `0x55` |
-
-The device answers every frame with a single status byte. A NAK means resend.
-
-**Cross-check.** `defib` opens a transfer to this same boot ROM over UART with
-the 14-byte header `FE 00 FF 01 <length:4> <address:4> <crc:2>`. That is
-exactly a FILE frame with `SEQ=0`, `~SEQ=0xFF` and `FILE=1` — so the frame
-layout above is corroborated by a working implementation, and only the pipe
-underneath differs.
-
-### Staging sequence
-
-Three images, in order — the same sequence `defib` uses over UART:
-
-| # | Image | Address | Notes |
+| Opcode | Name | Sent as | Answered with |
 |---|---|---|---|
-| 1 | DDR init | `0x04013000` | fixed 64-byte blob, brings the memory controller up |
-| 2 | SPL | `0x04010500` | the front of the U-Boot binary, into SRAM |
-| 3 | U-Boot | `0x41000000` | the whole image, into DRAM; starts on EOT |
+| `0xFE` | HEAD | `FE <length:4> <address:4>` | `AA 00` |
+| `0xFE` | OPEN | `FE <token:4> <token:4>` (both words equal) | `AA 00` |
+| `0xFA` | START | `FA <token:4> <token:4>` | `AA 00` |
+| `0xDA` | DATA | `DA <payload ≤511>` | *nothing* |
+| `0xED` | TAIL | `ED` | `AA 00`, or `55` if bytes are outstanding |
+| `0xAB` | CMD | `AB <length:2> <command text>` | console output + `[EOT]` |
+| `0xFB` | REQ | `FB` | next frame of a flash read-back |
 
-The SPL slice must stop where U-Boot's compressed payload begins (an LZMA
-`5D` + valid dictionary size, or a gzip `1F 8B 08`, rounded down to 1 KiB).
-Bytes past that boundary land in SRAM the boot ROM is using for its own stack,
-which hangs the chip mid-upload.
+Three details worth stating plainly:
 
-Everything in this stage lands in volatile memory. A wrong frame gets NAKed or
-ignored; nothing reaches flash, so a failed attempt costs a power cycle.
+- **A HEAD frame whose length equals its address is not a transfer.** The
+  device reads that as "open the channel" and stays in command mode. HiBurn
+  uses it once to open a boot ROM session, and the same shape with opcode
+  `0xFA` to sync before each agent upload. The token is ignored by the device.
+- **Replies are NUL-terminated.** The device sends `strlen(s) + 1` bytes, so a
+  bare ACK arrives as `AA 00`. Parse to the first NUL.
+- **`0xDA` carries no sequence and no checksum.** The payload starts at
+  offset 1, and never exceeds one max packet minus the opcode: **511 bytes**.
+
+## Stage 1 — the boot ROM
+
+```
+-> FE <token:4> <token:4>          open the session
+<- AA 00
+   for each of the three images:
+-> FE <length:4> <address:4>       announce
+<- AA 00
+-> DA <≤511 bytes>   × N           streamed back to back, none acknowledged
+-> ED                              close
+<- AA 00
+```
+
+Exactly **seven** replies cross the wire for a whole stage-1 run: one for the
+open, then a header and a tail ACK for each of three images. Waiting for an
+ACK per DATA frame deadlocks.
+
+### The three images
+
+| # | Image | Length | Address |
+|---|---|---|---|
+| 1 | DDR-init stub | `0x40` (64) | `0x04013000` |
+| 2 | SPL | `0x6000` (24576) | `0x04010500` |
+| 3 | U-Boot | whole file | `0x41000000` |
+
+The SPL is byte-identical to the **first `0x6000` bytes of the U-Boot image**
+— confirmed by reassembling both from the capture. HiBurn sends a flat
+`0x6000`; it does *not* scan for a compressed-payload boundary the way UART
+tools do.
+
+### The DDR stub is not just DDR init
+
+The 64-byte stub is a short ARM routine plus a literal pool:
+
+```asm
+push {lr}
+ldr  r0, [pc, #0x24]   ; 0x1202013C  = SYS_CTRL_REG_BASE + REG_SC_GEN1
+ldr  r1, [pc, #0x24]   ; 0x444F574E  = START_MAGIC, ASCII "DOWN"
+str  r1, [r0]
+ldr  r0, [pc, #0x20]   ; 0x12020140  = REG_SC_GEN2
+ldr  r1, [pc, #0x20]   ; 0x7A696A75
+str  r1, [r0], #4
+str  lr, [r0]          ; entry address into REG_SC_GEN3
+pop  {pc}
+```
+
+That `START_MAGIC` write is the load-bearing part. `download_boot()` in the
+U-Boot being loaded reads `REG_START_FLAG` and only enters its download loop
+if it finds exactly `0x444F574E`; otherwise it boots the camera normally and
+**no burn agent ever appears**. Both the register and the magic are defined in
+`arch/arm/include/asm/arch-hi3518ev300/platform.h`.
+
+This is the one field where a UART-derived profile is actively wrong: OpenIPC
+`defib`'s `hi3518ev300` profile carries `0x12345678` in that slot. The stub is
+otherwise byte-identical. `ChipProfile` refuses to construct without the right
+magic, so the mistake fails loudly instead of producing a camera that quietly
+reboots mid-flash.
 
 ## Stage 2 — the U-Boot burn agent
 
-Implemented device-side by `usb3_handle_protocol()` in
-`drivers/usb/gadget/hiudc3/usb3_prot.c`. The host writes a single opcode byte
-(plus arguments) to bulk OUT; the device replies on bulk IN. There is **no
-checksum and no sequence checking** in this stage.
+On enumerating, the agent sends an unsolicited greeting on bulk IN:
 
-| Opcode | Name | Host sends | Device answers |
-|---|---|---|---|
-| `0xFA` | START | `FA` | `AA` |
-| `0xFE` | HEAD | `FE <length:4> <address:4>` | `AA` |
-| `0xAB` | CMD | `AB <seq> <~seq> <command…> 00` | console output + `[EOT](OK\|ERROR)` |
-| `0xED` | TAIL | `ED` | `AA`, or `55` if bytes are still outstanding |
-| `0xFB` | REQ | `FB` | next frame of a flash read-back |
+```
+"start download process.\0"
+```
 
-Three details that are easy to get wrong:
+### Running commands
 
-- **The command text starts at offset 3.** The device calls
-  `run_command(buf + 3, 0)`; bytes 1 and 2 are the sequence pair and are not
-  examined.
-- **`length == address` in a HEAD frame is not a transfer.** The device reads
-  it as "open the output channel", sets `usb_connected`, and stays in command
-  mode. Send it once at the start of a session; never let a real transfer take
-  that shape.
-- **Replies are NUL-terminated.** `usb3_bulk_in_transfer()` sends
-  `strlen(s) + 1` bytes, so a bare ACK arrives as `AA 00`. Parse up to the
-  first NUL and ignore the rest of the packet.
+```
+-> AB <length:2> <command text>       length is strlen, text is not NUL-terminated
+<- <console output> "[EOT](OK)\r\n\0"
+```
+
+The reply arrives only once the command has *finished*, so a ten-megabyte
+`sf erase` simply means a long first read. While it runs the device answers
+with **zero-length packets** — the capture shows eight of them during one
+`sf erase 0x50000 0x300000`. A client must treat an empty read as "still
+working", not as a reply.
+
+Replies are copied into a fixed 200-byte buffer, so long console output is
+truncated mid-line. That is cosmetic, and visible in HiBurn's own logs too.
+
+Every reply begins with a space the device prepends.
+
+**A failed command ends the session.** On the `[EOT](ERROR)` path the
+device-side handler returns without re-arming its OUT endpoint, so it accepts
+nothing further. Recovering means power-cycling back into download mode.
 
 ### Uploading an image
 
 ```
--> FE <length:4> <address:4>     announce
-<- AA
--> <length raw bytes>            DMA'd straight to address, unframed
--> ED                            close
-<- AA
+-> FA <token:4> <token:4>      sync
+<- AA 00
+-> FE <length:4> <address:4>   announce; length is the exact file size
+<- AA 00
+-> <length raw bytes>          no framing, no opcodes, DMA'd straight to address
+-> ED
+<- AA 00
 ```
 
-The device arms its OUT endpoint for the whole announced length (up to 16 MiB
-minus one max-packet), so the host can stream in whatever chunk size it likes.
+Note the asymmetry with stage 1: the **boot ROM wants `DA`-framed data, the
+agent wants a raw stream**. HiBurn submits the whole image as a single bulk
+transfer; splitting it host-side is equivalent, because the device counts
+bytes down against the announced length and only completes on a short packet.
 
-### Running commands
+### Distinguishing the stages
 
-The reply arrives only once the command has *finished*, so a ten-megabyte
-`sf erase` simply means a long first read — not a hang. Budget the timeout by
-how much flash the command touches.
+Both stages answer `FA` with an ACK, so a ping proves only that *something* is
+listening. The discriminator is a command only U-Boot implements:
 
-The agent copies its reply into a fixed 200-byte buffer, so long console
-output is truncated. That is cosmetic for `sf erase`, whose progress spinner
-gets cut off mid-line, and is visible in HiBurn's own logs too.
+```
+AB 00 0F "getinfo version"   ->  " version: U-Boot 2016.11-g131d3f2\n[EOT](OK)\r\n"
+```
 
-**A failed command ends the session.** On the `[EOT](ERROR)` path the device
-returns without re-arming its OUT endpoint, so it accepts nothing further.
-Recovering means power-cycling back into download mode.
+## Flashing sequence
 
-### Flashing sequence
-
-This is what HiBurn does per partition, and what `hisiburn flash` reproduces:
+Per partition, verbatim from the capture:
 
 ```
 mw.b   0x41000000 0xFF <padded-length>    pre-fill the staging buffer
@@ -174,24 +206,56 @@ sf erase <partition-offset> <partition-size>
 sf write 0x41000000 <partition-offset> <padded-length>
 ```
 
-`<padded-length>` is the image size rounded up to the 64 KiB erase block. The
-pre-fill with `0xFF` means the tail of a short image is written as erased
-flash rather than as leftover bytes from the previous partition.
+`<padded-length>` is the image size rounded up to the 64 KiB erase block —
+1,908,952 bytes becomes `0x1e0000`, 5,693,440 becomes `0x570000`. The `0xFF`
+pre-fill means the tail of a short image is written as erased flash rather
+than as leftovers from the previous partition. The erase covers the whole
+partition; the write covers only the padded image.
 
-The boot partition is special: HiBurn writes it straight from `0x41000000`
-without a download first, because the U-Boot that stage 1 staged there is
-already the image that belongs in flash.
+The boot partition is special in HiBurn: it is written straight from
+`0x41000000` with no upload, because stage 1 left the U-Boot image there.
+`hisiburn` uploads it explicitly instead — one extra transfer, in exchange for
+`--only boot` working on a camera that is already running the agent.
 
-## Confidence
+Finally, `reset`.
+
+## Provenance
 
 | Claim | Basis |
 |---|---|
-| Stage-2 opcodes, offsets, replies | read from the device-side handler |
-| Stage-2 flashing sequence | read from a real HiBurn session log |
-| USB ids, endpoints, descriptors | read from the gadget's descriptor tables |
-| CRC | transcribed from vendor source; table verified byte-for-byte |
-| Stage-1 frame layout | vendor header, corroborated by `defib`'s working UART implementation |
-| Stage-1 USB handshake | **inferred.** The frames are documented; whether the boot ROM wants an inquire or any preamble before the first FILE frame over USB is not. |
+| USB ids, endpoints, descriptors | captured descriptors |
+| Every frame layout | captured frames, byte-compared in the test suite |
+| DATA payload limit of 511 | maximum observed across 513 captured frames |
+| ACK cadence (7 replies in stage 1) | counted from the capture |
+| The three stage-1 images and addresses | captured headers; payloads reassembled |
+| SPL == first 0x6000 of U-Boot | both reassembled from the capture and compared |
+| `START_MAGIC` semantics | captured stub, decoded against vendor `platform.h` |
+| Flashing command sequence | captured command frames + HiBurn log |
+| Zero-length packets during long commands | observed during `sf erase` |
+| Error path stops the session | vendor source (`usb3_prot.c`), not exercised in the capture |
 
-The last row is the one open question. It is also the safe one to experiment
-with: stage 1 only writes to volatile memory.
+The one item resting on source rather than observation is the last: a failed
+command was never provoked in the captured run.
+
+## For the record: what a source-only reading got wrong
+
+The first version of this document was written from the vendor sources alone,
+before a capture existed. It was right about the USB identity, the agent's
+`FE`/`ED` frames, the raw upload path and the whole flashing sequence — and
+wrong about five things, every one of which the capture settled:
+
+1. **The boot ROM's product id.** Guessed `0x3609` from a commented-out
+   constant; it is `0xD001`, the same as the agent.
+2. **Stage-1 framing.** Read the `usb3_prot.h` comment as the USB layout —
+   14-byte headers, `SEQ`/`~SEQ`, CRC-16, 1024-byte payloads. That is the UART
+   protocol. USB uses 9-byte headers, no sequence, no checksum, 511-byte
+   payloads.
+3. **The session-open frame.** Missed entirely.
+4. **ACK cadence.** Assumed every DATA frame was acknowledged; only headers
+   and tails are.
+5. **The DDR stub's `START_MAGIC`.** Shipped `defib`'s UART value. Four bytes,
+   and without the right ones the loaded U-Boot never enters download mode.
+
+The command frame was also `AB <seq> <~seq> <text> 00` rather than
+`AB <length:2> <text>`; this firmware tolerates it, but it is not what the
+vendor sends and the serial variant does read that length field.

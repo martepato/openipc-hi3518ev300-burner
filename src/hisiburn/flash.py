@@ -16,7 +16,13 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from hisiburn.agent import BurnAgent
+from hisiburn.agent import (
+    BurnAgent,
+    erase_command,
+    memset_command,
+    probe_command,
+    write_command,
+)
 from hisiburn.layout import FlashLayout, LayoutError, Partition, round_up
 
 log = logging.getLogger(__name__)
@@ -52,10 +58,10 @@ class PartitionJob:
 
     def summary(self) -> str:
         if self.erase_only:
-            return f"{self.name}: erase 0x{self.partition.size:X} at 0x{self.partition.offset:X}"
+            return f"{self.name}: erase 0x{self.partition.size:x} at 0x{self.partition.offset:x}"
         return (
             f"{self.name}: {self.image_path.name} ({self.image_size} bytes) "
-            f"-> 0x{self.partition.offset:X}, writing 0x{self.write_length:X}"
+            f"-> 0x{self.partition.offset:x}, writing 0x{self.write_length:x}"
         )
 
 
@@ -81,15 +87,12 @@ class FlashPlan:
         staging = self.layout.staging_address
         for job in self.jobs:
             if not job.erase_only:
-                yield f"mw.b 0x{staging:X} 0xFF 0x{job.write_length:X}"
-                yield f"<upload {job.image_path.name}: {job.image_size} bytes -> 0x{staging:X}>"
-            yield "sf probe 0"
-            yield f"sf erase 0x{job.partition.offset:X} 0x{job.partition.size:X}"
+                yield memset_command(staging, 0xFF, job.write_length)
+                yield f"<upload {job.image_path.name}: {job.image_size} bytes -> 0x{staging:x}>"
+            yield probe_command()
+            yield erase_command(job.partition.offset, job.partition.size)
             if not job.erase_only:
-                yield (
-                    f"sf write 0x{staging:X} 0x{job.partition.offset:X} "
-                    f"0x{job.write_length:X}"
-                )
+                yield write_command(staging, job.partition.offset, job.write_length)
         yield "reset"
 
 
@@ -200,7 +203,7 @@ def run_plan(
 
         if not job.erase_only:
             assert job.image_path is not None
-            on_step(f"{prefix}: padding staging buffer to 0x{job.write_length:X}")
+            on_step(f"{prefix}: padding staging buffer to 0x{job.write_length:x}")
             agent.memset(staging, 0xFF, job.write_length)
 
             on_step(f"{prefix}: uploading {job.image_path.name} ({job.image_size} bytes)")
@@ -209,13 +212,13 @@ def run_plan(
         agent.flash_probe()
 
         on_step(
-            f"{prefix}: erasing 0x{job.partition.size:X} at 0x{job.partition.offset:X}"
+            f"{prefix}: erasing 0x{job.partition.size:x} at 0x{job.partition.offset:x}"
         )
         agent.flash_erase(job.partition.offset, job.partition.size)
 
         if not job.erase_only:
             on_step(
-                f"{prefix}: writing 0x{job.write_length:X} to 0x{job.partition.offset:X}"
+                f"{prefix}: writing 0x{job.write_length:x} to 0x{job.partition.offset:x}"
             )
             agent.flash_write(staging, job.partition.offset, job.write_length)
 
