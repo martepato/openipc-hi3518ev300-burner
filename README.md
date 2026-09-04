@@ -48,8 +48,13 @@ Unplug it, hold the reset button, plug the USB cable back in while still
 holding, and keep holding for a couple of seconds.
 
 ```sh
-hisiburn probe
+hisiburn probe --wait 30
 ```
+
+`--wait` starts scanning first, so you can run the command and *then* do the
+unplug/hold-reset/replug dance — handy, because the download-mode window is
+short. All of `--verbose`, `--wait` and `--pid` work on either side of the
+subcommand.
 
 ```
 Found 1 HiSilicon device(s):

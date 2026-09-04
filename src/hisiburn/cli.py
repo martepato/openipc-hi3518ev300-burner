@@ -15,6 +15,7 @@ from hisiburn.flash import PlanError, build_plan, run_plan, verify_flash_chip
 from hisiburn.hitool_log import LogParseError, layout_from_log, parse_sessions
 from hisiburn.layout import BUILTIN_LAYOUTS, FlashLayout, LayoutError, get_layout
 from hisiburn.usbdev import (
+    BackendMissing,
     BulkPipe,
     DeviceNotFound,
     UsbError,
@@ -90,7 +91,22 @@ def connect_agent(product_id: int | None, wait: float) -> tuple[BulkPipe, BurnAg
 
 
 def cmd_probe(args: argparse.Namespace) -> int:
-    devices = list_devices()
+    def scan() -> list:
+        found = list_devices()
+        if args.pid is not None:
+            found = [d for d in found if d.product_id == args.pid]
+        return found
+
+    devices = scan()
+    if not devices and args.wait:
+        # The download-mode window is short, so let the user start the scan and
+        # then do the unplug/hold-reset/replug dance.
+        print(f"Waiting up to {args.wait:.0f}s — plug the camera in now (holding reset)...")
+        deadline = time.monotonic() + args.wait
+        while not devices and time.monotonic() < deadline:
+            time.sleep(0.2)
+            devices = scan()
+
     if not devices:
         print("No HiSilicon USB device found (vendor 12d1).")
         print()
@@ -102,6 +118,10 @@ def cmd_probe(args: argparse.Namespace) -> int:
         print()
         print("macOS needs no driver for this — if nothing appears, the camera is")
         print("not entering download mode rather than being unsupported.")
+        if not args.wait:
+            print()
+            print("Tip: `hisiburn probe --wait 30` starts scanning first, so you can")
+            print("run it and then do the unplug/hold-reset/replug dance.")
         return 1
 
     print(f"Found {len(devices)} HiSilicon device(s):")
@@ -300,48 +320,84 @@ def cmd_layouts(args: argparse.Namespace) -> int:
 # --- argument parsing -------------------------------------------------------
 
 
+#: Defaults for the options accepted on either side of the subcommand. They
+#: are applied after parsing rather than through ``set_defaults``: ``parents=``
+#: shares one action object between the top-level parser and every subparser,
+#: so setting a default on the parser would also overwrite it on the copies and
+#: undo the SUPPRESS that keeps them from clobbering each other.
+SHARED_DEFAULTS = {"verbose": False, "pid": None, "wait": 0.0}
+
+
+def _shared_options() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
+    """Options accepted on either side of the subcommand.
+
+    Each is attached to the top-level parser *and* to every subcommand that
+    wants it, so both `hisiburn -v probe` and `hisiburn probe -v` work. The
+    copies use SUPPRESS defaults: without that, a subparser's default would
+    overwrite a value already given before the subcommand.
+    """
+    general = argparse.ArgumentParser(add_help=False)
+    general.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+        help="log protocol detail",
+    )
+
+    device = argparse.ArgumentParser(add_help=False)
+    device.add_argument(
+        "--pid", type=lambda value: int(value, 0), default=argparse.SUPPRESS,
+        help="override the USB product id to open",
+    )
+    device.add_argument(
+        "--wait", type=float, default=argparse.SUPPRESS, metavar="SECONDS",
+        help="wait this long for the device to appear instead of failing immediately",
+    )
+    return general, device
+
+
 def build_parser() -> argparse.ArgumentParser:
+    general, device = _shared_options()
+
     parser = argparse.ArgumentParser(
         prog="hisiburn",
+        parents=[general, device],
         description=(
             "Flash HiSilicon Hi3518EV300 cameras over USB from macOS or Linux. "
             "An open replacement for HiTool/HiBurn that needs no driver install."
         ),
     )
     parser.add_argument("--version", action="version", version=f"hisiburn {__version__}")
-    parser.add_argument("-v", "--verbose", action="store_true", help="log protocol detail")
-    parser.add_argument(
-        "--pid",
-        type=lambda value: int(value, 0),
-        help="override the USB product id to open",
-    )
-    parser.add_argument(
-        "--wait",
-        type=float,
-        default=0.0,
-        metavar="SECONDS",
-        help="wait for the device to appear instead of failing immediately",
-    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    probe = sub.add_parser("probe", help="list attached HiSilicon devices")
+    probe = sub.add_parser(
+        "probe", parents=[general, device], help="list attached HiSilicon devices"
+    )
     probe.set_defaults(func=cmd_probe)
 
-    info = sub.add_parser("info", help="query a running burn agent")
+    info = sub.add_parser(
+        "info", parents=[general, device], help="query a running burn agent"
+    )
     info.set_defaults(func=cmd_info)
 
-    run = sub.add_parser("run", help="run U-Boot console commands through the agent")
+    run = sub.add_parser(
+        "run", parents=[general, device],
+        help="run U-Boot console commands through the agent",
+    )
     run.add_argument("command", nargs="+", help="commands to run in order")
     run.add_argument("--timeout", type=int, default=30, help="seconds per command")
     run.set_defaults(func=cmd_run)
 
-    boot = sub.add_parser("boot", help="load and start U-Boot via the boot ROM")
+    boot = sub.add_parser(
+        "boot", parents=[general, device], help="load and start U-Boot via the boot ROM"
+    )
     boot.add_argument("-f", "--file", required=True, help="U-Boot binary")
     boot.add_argument("-c", "--chip", default="hi3518ev300", help="chip profile")
     boot.set_defaults(func=cmd_boot)
 
-    flash = sub.add_parser("flash", help="write a firmware set to the camera's flash")
+    flash = sub.add_parser(
+        "flash", parents=[general, device],
+        help="write a firmware set to the camera's flash",
+    )
     flash.add_argument("-d", "--dir", default=".", help="directory holding the images")
     flash.add_argument("-l", "--layout", default="mjsxj02hl-16m", help="built-in layout name")
     flash.add_argument("--layout-file", help="JSON layout produced by `hisiburn from-log -o`")
@@ -360,7 +416,10 @@ def build_parser() -> argparse.ArgumentParser:
     flash.add_argument("--no-reset", action="store_true", help="leave the camera halted")
     flash.set_defaults(func=cmd_flash)
 
-    from_log = sub.add_parser("from-log", help="recover a flash layout from a HiBurn log")
+    from_log = sub.add_parser(
+        "from-log", parents=[general],
+        help="recover a flash layout from a HiBurn log",
+    )
     from_log.add_argument("log", help="HiTool/HiBurn log file")
     from_log.add_argument("--session", type=int, default=-1, help="which session (default: last)")
     from_log.add_argument("--name", default="from-log", help="name for the layout")
@@ -368,7 +427,9 @@ def build_parser() -> argparse.ArgumentParser:
     from_log.add_argument("--list", action="store_true", help="list sessions and stop")
     from_log.set_defaults(func=cmd_from_log)
 
-    layouts = sub.add_parser("layouts", help="show the built-in flash layouts")
+    layouts = sub.add_parser(
+        "layouts", parents=[general], help="show the built-in flash layouts"
+    )
     layouts.set_defaults(func=cmd_layouts)
 
     return parser
@@ -376,6 +437,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    for name, default in SHARED_DEFAULTS.items():
+        if not hasattr(args, name):
+            setattr(args, name, default)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(name)s: %(message)s",
@@ -384,6 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except (
+        BackendMissing,
         CliError,
         PlanError,
         LayoutError,

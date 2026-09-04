@@ -32,6 +32,21 @@ KNOWN_PRODUCT_IDS = (PRODUCT_ID,)
 DEFAULT_TIMEOUT_MS = 5000
 
 
+class BackendMissing(Exception):
+    """libusb itself is not installed, so no USB call can be made at all."""
+
+    HINT = (
+        "pyusb cannot find libusb.\n"
+        "  macOS:  brew install libusb\n"
+        "  Debian/Ubuntu:  sudo apt install libusb-1.0-0\n"
+        "  Fedora:  sudo dnf install libusb1\n"
+        "This is a missing library on your machine, not a problem with the camera."
+    )
+
+    def __init__(self, detail: str = ""):
+        super().__init__(f"{self.HINT}\n({detail})" if detail else self.HINT)
+
+
 class DeviceNotFound(Exception):
     """No camera in a USB download mode is attached."""
 
@@ -90,9 +105,17 @@ def _describe(device: usb.core.Device) -> FoundDevice:
     )
 
 
+def _find(**kwargs: object) -> object:
+    """``usb.core.find`` with the no-libusb case turned into a useful message."""
+    try:
+        return usb.core.find(**kwargs)
+    except usb.core.NoBackendError as exc:
+        raise BackendMissing(str(exc)) from exc
+
+
 def list_devices(vendor_id: int = VENDOR_ID) -> list[FoundDevice]:
     """Every attached device under ``vendor_id``, whether or not we know it."""
-    return [_describe(dev) for dev in usb.core.find(find_all=True, idVendor=vendor_id)]
+    return [_describe(dev) for dev in _find(find_all=True, idVendor=vendor_id)]
 
 
 def find_device(
@@ -107,7 +130,7 @@ def find_device(
     """
     wanted = (product_id,) if product_id is not None else KNOWN_PRODUCT_IDS
     for pid in wanted:
-        for device in usb.core.find(find_all=True, idVendor=VENDOR_ID, idProduct=pid):
+        for device in _find(find_all=True, idVendor=VENDOR_ID, idProduct=pid):
             if exclude is not None and (
                 getattr(device, "bus", None),
                 getattr(device, "address", None),

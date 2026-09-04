@@ -70,3 +70,125 @@ def test_boot_rejects_a_missing_file(capsys, tmp_path):
 def test_boot_rejects_an_unknown_chip(capsys, firmware):
     assert main(["boot", "-f", str(firmware / "u-boot.bin"), "-c", "hi9999"]) == 1
     assert "unknown chip" in capsys.readouterr().err
+
+
+# --- argument placement -----------------------------------------------------
+#
+# argparse only accepts an option where it is defined. Options declared once on
+# the top-level parser are rejected after the subcommand, which is how most
+# people type them -- and how this project's own README documented `probe
+# --verbose`. Both placements must work.
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["-v", "layouts"],
+        ["layouts", "-v"],
+        ["layouts", "--verbose"],
+        ["--verbose", "layouts"],
+    ],
+)
+def test_verbose_is_accepted_on_either_side_of_the_subcommand(argv):
+    assert main(argv) == 0
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["-v", "probe"], {"verbose": True, "wait": 0.0, "pid": None}),
+        (["probe", "-v"], {"verbose": True, "wait": 0.0, "pid": None}),
+        (["probe"], {"verbose": False, "wait": 0.0, "pid": None}),
+        (["--wait", "5", "probe"], {"verbose": False, "wait": 5.0, "pid": None}),
+        (["probe", "--wait", "5"], {"verbose": False, "wait": 5.0, "pid": None}),
+        (["--pid", "0xd001", "info"], {"verbose": False, "wait": 0.0, "pid": 0xD001}),
+        (["info", "--pid", "0xd001"], {"verbose": False, "wait": 0.0, "pid": 0xD001}),
+        (["-v", "--wait", "3", "flash"], {"verbose": True, "wait": 3.0, "pid": None}),
+        (["flash", "--verbose", "--wait", "3"], {"verbose": True, "wait": 3.0, "pid": None}),
+        (["-v", "boot", "-f", "x.bin", "--wait", "9"],
+         {"verbose": True, "wait": 9.0, "pid": None}),
+    ],
+)
+def test_shared_options_parse_the_same_in_both_positions(argv, expected):
+    from hisiburn.cli import SHARED_DEFAULTS, build_parser
+
+    args = build_parser().parse_args(argv)
+    for name, default in SHARED_DEFAULTS.items():
+        if not hasattr(args, name):
+            setattr(args, name, default)
+    assert {name: getattr(args, name) for name in expected} == expected
+
+
+def test_a_value_given_before_the_subcommand_survives_it():
+    # `parents=` shares one action object across parsers, so a default set on
+    # the top-level parser would also land on the subparser copies and wipe
+    # this out. Defaults are applied after parsing to avoid exactly that.
+    from hisiburn.cli import build_parser
+
+    args = build_parser().parse_args(["-v", "--wait", "7", "probe"])
+    assert args.verbose is True
+    assert args.wait == 7.0
+
+
+def test_subcommands_that_touch_no_device_reject_device_options():
+    from hisiburn.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["layouts", "--pid", "0xd001"])
+
+
+# --- missing libusb ---------------------------------------------------------
+
+
+def test_missing_libusb_is_explained_rather_than_traced(capsys, monkeypatch):
+    import usb.core
+
+    def no_backend(*args, **kwargs):
+        raise usb.core.NoBackendError("No backend available")
+
+    monkeypatch.setattr(usb.core, "find", no_backend)
+    assert main(["probe"]) == 1
+    err = capsys.readouterr().err
+    assert "brew install libusb" in err
+    assert "not a problem with the camera" in err
+
+
+def test_probe_reports_nothing_found_with_a_wait_tip(capsys, monkeypatch):
+    monkeypatch.setattr("hisiburn.cli.list_devices", lambda: [])
+    assert main(["probe"]) == 1
+    out = capsys.readouterr().out
+    assert "No HiSilicon USB device found" in out
+    assert "--wait 30" in out, "should suggest the flag that helps here"
+
+
+def test_probe_waits_for_a_device_to_appear(capsys, monkeypatch):
+    from hisiburn.usbdev import FoundDevice
+
+    device = FoundDevice(
+        vendor_id=0x12D1, product_id=0xD001, bus=20, address=7,
+        manufacturer="Hisilicon", product="HiUSBBurn",
+    )
+    calls = {"n": 0}
+
+    def appears_on_third_scan():
+        calls["n"] += 1
+        return [device] if calls["n"] >= 3 else []
+
+    monkeypatch.setattr("hisiburn.cli.list_devices", appears_on_third_scan)
+    monkeypatch.setattr("hisiburn.cli.time.sleep", lambda _: None)
+    assert main(["probe", "--wait", "5"]) == 0
+    assert "12d1:d001" in capsys.readouterr().out
+
+
+def test_probe_filters_by_pid(capsys, monkeypatch):
+    from hisiburn.usbdev import FoundDevice
+
+    devices = [
+        FoundDevice(0x12D1, 0xD001, 20, 7, "Hisilicon", "HiUSBBurn"),
+        FoundDevice(0x12D1, 0x1234, 20, 8, "Hisilicon", "Something else"),
+    ]
+    monkeypatch.setattr("hisiburn.cli.list_devices", lambda: devices)
+    assert main(["probe", "--pid", "0xd001"]) == 0
+    out = capsys.readouterr().out
+    assert "12d1:d001" in out
+    assert "12d1:1234" not in out
