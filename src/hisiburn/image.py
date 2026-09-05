@@ -36,6 +36,18 @@ UIMAGE_OS = {0: "invalid", 5: "Linux", 17: "U-Boot"}
 UIMAGE_COMPRESSION = {0: "uncompressed", 1: "gzip", 2: "bzip2", 3: "lzma", 4: "lzo"}
 SQUASHFS_MAGIC = b"hsqs"
 JFFS2_MAGIC = b"\x85\x19"
+
+#: JFFS2 node types. Requiring one of these alongside the magic turns a
+#: 16-bit signature into a 32-bit one, which is the difference between
+#: matching real nodes and matching noise: a bare 0x1985 lands roughly once
+#: per 64 KiB of random data, so on a 16 MiB image it appears everywhere.
+JFFS2_NODETYPES = {
+    0xE001: "dirent", 0xE002: "inode", 0x2003: "cleanmarker",
+    0x2004: "padding", 0x2006: "summary", 0xE008: "xattr", 0xE009: "xref",
+}
+
+#: A node bigger than this is not a node; JFFS2 keeps them small.
+JFFS2_MAX_NODE = 1 << 20
 GZIP_MAGIC = b"\x1f\x8b\x08"
 UBI_MAGIC = b"UBI#"
 
@@ -139,11 +151,17 @@ class ImageReport:
         erase block and the regions tile the chip with no gaps.
         """
         starts: list[tuple[int, str]] = []
+        covered_until = 0
         for finding in self.findings:
+            # Anything sitting inside the previous structure's own extent is
+            # its payload, not the start of a new partition.
+            if finding.offset < covered_until:
+                continue
             edge = finding.offset - (finding.offset % ERASE_BLOCK)
             label = finding.kind
             if finding.kind == "gzip" and edge == 0:
                 label = "bootloader"
+            covered_until = finding.end or finding.offset
             if starts and starts[-1][0] == edge:
                 continue
             starts.append((edge, label))
@@ -238,6 +256,58 @@ def _gzip(data: bytes, offset: int) -> Finding:
     )
 
 
+def _jffs2_node(data: bytes, offset: int) -> tuple[int, int] | None:
+    """Validate a JFFS2 node header, returning (nodetype, total length)."""
+    if offset % 4 or offset + 12 > len(data):
+        return None
+    magic, nodetype, totlen = struct.unpack_from("<HHI", data, offset)
+    if magic != 0x1985 or nodetype not in JFFS2_NODETYPES:
+        return None
+    if not (12 <= totlen <= JFFS2_MAX_NODE) or offset + totlen > len(data):
+        return None
+    return nodetype, totlen
+
+
+def _jffs2_regions(data: bytes) -> list[Finding]:
+    """Find JFFS2 areas, collapsing each run of nodes into one finding."""
+    nodes: list[tuple[int, int, int]] = []
+    for match in re.finditer(re.escape(JFFS2_MAGIC), data):
+        node = _jffs2_node(data, match.start())
+        if node is not None:
+            nodes.append((match.start(), node[0], node[1]))
+
+    regions: list[Finding] = []
+    for offset, nodetype, totlen in nodes:
+        # Nodes run back to back, and a region is usually padded out with
+        # erased flash, so anything within an erase block of the last node
+        # belongs to the region already open.
+        if regions and offset - (regions[-1].detail["last_node_end"]) < ERASE_BLOCK:
+            region = regions[-1]
+            region.detail["nodes"] += 1
+            region.detail["last_node_end"] = offset + totlen
+            region.detail["types"].add(JFFS2_NODETYPES[nodetype])
+            region.size = region.detail["last_node_end"] - region.offset
+            region.description = (
+                f"{region.detail['nodes']} nodes "
+                f"({', '.join(sorted(region.detail['types']))})"
+            )
+            continue
+        regions.append(
+            Finding(
+                offset=offset,
+                kind="jffs2",
+                size=totlen,
+                description=f"1 node ({JFFS2_NODETYPES[nodetype]})",
+                detail={
+                    "nodes": 1,
+                    "last_node_end": offset + totlen,
+                    "types": {JFFS2_NODETYPES[nodetype]},
+                },
+            )
+        )
+    return regions
+
+
 def inspect_image(path: Path) -> ImageReport:
     """Scan a firmware file for the structures these cameras use."""
     path = Path(path)
@@ -258,13 +328,8 @@ def inspect_image(path: Path) -> ImageReport:
     for match in re.finditer(re.escape(GZIP_MAGIC), data[: ERASE_BLOCK * 4]):
         report.findings.append(_gzip(data, match.start()))
 
-    # JFFS2 is a stream of small nodes, so report only the first of each run.
-    last_jffs2 = -ERASE_BLOCK
-    for match in re.finditer(re.escape(JFFS2_MAGIC), data):
-        offset = match.start()
-        if offset - last_jffs2 >= ERASE_BLOCK and offset % 4 == 0:
-            report.findings.append(Finding(offset, "jffs2", "filesystem"))
-            last_jffs2 = offset
+    for finding in _jffs2_regions(data):
+        report.findings.append(finding)
 
     report.findings.sort(key=lambda f: f.offset)
 
@@ -282,3 +347,83 @@ def inspect_image(path: Path) -> ImageReport:
                 "partition rather than starting one"
             )
     return report
+
+
+# --- comparing two images ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DiffRegion:
+    """A contiguous run of erase blocks whose contents differ."""
+
+    offset: int
+    length: int
+
+    @property
+    def end(self) -> int:
+        return self.offset + self.length
+
+
+def compare_images(
+    first: Path, second: Path, block: int = ERASE_BLOCK
+) -> tuple[list[DiffRegion], int]:
+    """Compare two images at erase-block granularity.
+
+    Returns the differing regions and the number of blocks compared. Blocks
+    are the right unit: flash can only be erased that way, so a difference
+    anywhere in a block means the whole block has to be written differently.
+    """
+    left = Path(first).read_bytes()
+    right = Path(second).read_bytes()
+    span = max(len(left), len(right))
+
+    regions: list[DiffRegion] = []
+    blocks = 0
+    for offset in range(0, span, block):
+        blocks += 1
+        if left[offset : offset + block] == right[offset : offset + block]:
+            continue
+        if regions and regions[-1].end == offset:
+            regions[-1] = DiffRegion(regions[-1].offset, regions[-1].length + block)
+        else:
+            regions.append(DiffRegion(offset, block))
+    return regions, blocks
+
+
+def describe_comparison(first: Path, second: Path) -> str:
+    """A readable account of how two firmware images differ."""
+    first, second = Path(first), Path(second)
+    left, right = inspect_image(first), inspect_image(second)
+    regions, blocks = compare_images(first, second)
+
+    lines = [f"{first.name}", f"{second.name}", ""]
+    if left.size != right.size:
+        lines.append(f"sizes differ: {left.size:,} vs {right.size:,} bytes")
+    else:
+        lines.append(f"both {left.size:,} bytes")
+
+    if not regions:
+        lines.append("identical")
+        return "\n".join(lines)
+
+    extents = left.boundaries() or right.boundaries()
+
+    def partition_at(offset: int) -> str:
+        for start, length, label in extents:
+            if start <= offset < start + length:
+                return f"{label} at 0x{start:07X}"
+        return "outside any recognised partition"
+
+    differing = sum(r.length for r in regions)
+    lines.append(
+        f"{len(regions)} differing region(s), {differing // 1024} KiB of "
+        f"{blocks * ERASE_BLOCK // 1024} KiB "
+        f"({differing / (blocks * ERASE_BLOCK) * 100:.2f}% of the chip)"
+    )
+    lines.append("")
+    for region in regions:
+        lines.append(
+            f"  0x{region.offset:07X}..0x{region.end:07X}  "
+            f"{region.length // 1024:>5} KiB  {partition_at(region.offset)}"
+        )
+    return "\n".join(lines)

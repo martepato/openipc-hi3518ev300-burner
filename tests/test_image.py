@@ -17,6 +17,18 @@ def _uimage(name: str, data_size: int, load: int = 0x40008000) -> bytes:
     return bytes(header)
 
 
+def _jffs2_nodes(count: int = 6) -> bytes:
+    """A run of JFFS2 nodes: a cleanmarker followed by inodes."""
+    out = bytearray()
+    struct.pack_into("<HHI", (first := bytearray(12)), 0, 0x1985, 0x2003, 12)
+    out += first
+    for _ in range(count - 1):
+        node = bytearray(64)
+        struct.pack_into("<HHI", node, 0, 0x1985, 0xE002, 64)
+        out += node
+    return bytes(out)
+
+
 def _squashfs(inodes: int, bytes_used: int, block_size: int = 131072) -> bytes:
     block = bytearray(96)
     block[0:4] = b"hsqs"
@@ -45,7 +57,7 @@ def factory_dump(tmp_path):
         (0xBC0000, 1, 162),
     ):
         image[offset : offset + 96] = _squashfs(inodes, used)
-    image[0xF90000 : 0xF90000 + 12] = b"\x85\x19\x02\xe0" + b"\x00" * 8
+    image[0xF90000 : 0xF90000 + len(_jffs2_nodes())] = _jffs2_nodes()
 
     path = tmp_path / "factory.bin"
     path.write_bytes(bytes(image))
@@ -63,6 +75,39 @@ def test_a_full_dump_is_recognised(factory_dump):
 def test_every_structure_is_found(factory_dump):
     kinds = [f.kind for f in inspect_image(factory_dump).findings]
     assert kinds == ["gzip", "uImage", "squashfs", "squashfs", "squashfs", "squashfs", "jffs2"]
+
+
+def test_a_run_of_jffs2_nodes_is_one_finding(factory_dump):
+    jffs2 = [f for f in inspect_image(factory_dump).findings if f.kind == "jffs2"]
+    assert len(jffs2) == 1, "a node run is one region, not one finding per node"
+    assert jffs2[0].offset == 0xF90000
+    assert jffs2[0].detail["nodes"] == 6
+
+
+def test_the_two_byte_jffs2_magic_alone_is_not_enough(tmp_path):
+    # 0x1985 turns up about once per 64 KiB of random data. Matching on it
+    # alone reported dozens of phantom filesystems inside a real kernel and
+    # squashfs payloads, which wrecked the inferred layout.
+    import os
+
+    path = tmp_path / "random.bin"
+    path.write_bytes(os.urandom(4 * 1024 * 1024))
+    assert not [f for f in inspect_image(path).findings if f.kind == "jffs2"]
+
+
+def test_a_structure_inside_another_is_not_a_partition_start(tmp_path):
+    # A squashfs payload can contain anything, including bytes that look like
+    # a header. Only structures beyond the previous one's declared extent
+    # start a partition.
+    image = bytearray(b"\xff" * (4 * 1024 * 1024))
+    image[0:32] = bytes.fromhex("150500ea" + "feffffea" * 7)
+    image[0x100 : 0x100 + 14] = b"\x1f\x8b\x08\x08" + b"\x00" * 6 + b"boot\x00"
+    image[0x100000 : 0x100000 + 96] = _squashfs(10, 0x200000)
+    image[0x180000 : 0x180000 + 96] = _squashfs(10, 4096)  # inside the first
+    path = tmp_path / "nested.bin"
+    path.write_bytes(bytes(image))
+    extents = inspect_image(path).boundaries()
+    assert [offset for offset, _, _ in extents] == [0, 0x100000]
 
 
 def test_structure_details_are_read_correctly(factory_dump):
@@ -210,3 +255,67 @@ def test_a_chip_sized_package_is_still_a_package(tmp_path):
     report = inspect_image(path)
     assert report.is_chip_sized
     assert not report.is_full_dump
+
+
+# --- comparing two images ---------------------------------------------------
+
+
+def test_identical_images_compare_clean(factory_dump, tmp_path):
+    from hisiburn.image import compare_images, describe_comparison
+
+    copy = tmp_path / "copy.bin"
+    copy.write_bytes(factory_dump.read_bytes())
+    regions, blocks = compare_images(factory_dump, copy)
+    assert regions == []
+    assert blocks == 16 * 1024 * 1024 // ERASE_BLOCK
+    assert "identical" in describe_comparison(factory_dump, copy)
+
+
+def test_a_difference_is_reported_at_erase_block_granularity(factory_dump, tmp_path):
+    from hisiburn.image import compare_images
+
+    variant = bytearray(factory_dump.read_bytes())
+    variant[0x38000] ^= 0xFF  # a single byte
+    path = tmp_path / "variant.bin"
+    path.write_bytes(bytes(variant))
+
+    regions, _ = compare_images(factory_dump, path)
+    # Flash erases in blocks, so one changed byte means one changed block.
+    assert len(regions) == 1
+    assert regions[0].offset == 0x30000
+    assert regions[0].length == ERASE_BLOCK
+
+
+def test_adjacent_differing_blocks_merge_into_one_region(factory_dump, tmp_path):
+    from hisiburn.image import compare_images
+
+    variant = bytearray(factory_dump.read_bytes())
+    variant[0x30000:0x50000] = b"\x00" * 0x20000
+    path = tmp_path / "variant.bin"
+    path.write_bytes(bytes(variant))
+
+    regions, _ = compare_images(factory_dump, path)
+    assert len(regions) == 1
+    assert (regions[0].offset, regions[0].length) == (0x30000, 0x20000)
+
+
+def test_a_difference_is_attributed_to_its_partition(factory_dump, tmp_path):
+    from hisiburn.image import describe_comparison
+
+    variant = bytearray(factory_dump.read_bytes())
+    variant[0x38000:0x38100] = b"SIGNATURE-BLOCK-" * 16
+    path = tmp_path / "signed.bin"
+    path.write_bytes(bytes(variant))
+
+    text = describe_comparison(path, factory_dump)
+    assert "1 differing region" in text
+    assert "bootloader at 0x0000000" in text
+    assert "0x0030000..0x0040000" in text
+
+
+def test_differing_sizes_are_called_out(factory_dump, tmp_path):
+    from hisiburn.image import describe_comparison
+
+    short = tmp_path / "short.bin"
+    short.write_bytes(factory_dump.read_bytes()[: 8 * 1024 * 1024])
+    assert "sizes differ" in describe_comparison(factory_dump, short)

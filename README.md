@@ -188,6 +188,21 @@ verdict: a U-Boot firmware update package ("hlc6") — meant for the camera's
 own updater (the SD-card recovery procedure), not for writing to flash
 ```
 
+Two dumps of the same camera can be diffed at erase-block granularity, which
+is the unit that matters — a byte's difference means the whole block has to be
+written differently:
+
+```sh
+hisiburn inspect signed.bin --compare unsigned.bin
+```
+
+```
+both 16,777,216 bytes
+1 differing region(s), 64 KiB of 16384 KiB (0.39% of the chip)
+
+  0x0030000..0x0040000     64 KiB  bootloader at 0x0000000
+```
+
 ### Restoring a whole-chip dump
 
 ```sh

@@ -23,7 +23,7 @@ from hisiburn.flash import (
 )
 from hisiburn.hitool_log import LogParseError, layout_from_log, parse_sessions
 from hisiburn.hitool_xml import XmlParseError, find_partition_table, layout_from_xml
-from hisiburn.image import inspect_image
+from hisiburn.image import describe_comparison, inspect_image
 from hisiburn.layout import BUILTIN_LAYOUTS, FlashLayout, LayoutError, get_layout
 from hisiburn.usbdev import (
     BackendMissing,
@@ -406,6 +406,14 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     path = Path(args.image)
     if not path.is_file():
         raise CliError(f"image not found: {path}")
+
+    if args.compare:
+        other = Path(args.compare)
+        if not other.is_file():
+            raise CliError(f"image not found: {other}")
+        print(describe_comparison(path, other))
+        return 0
+
     print(inspect_image(path).describe())
     return 0
 
@@ -642,6 +650,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="say what a firmware .bin actually is, without writing anything",
     )
     inspect.add_argument("image", help="firmware file to examine")
+    inspect.add_argument(
+        "--compare", metavar="OTHER",
+        help="diff against another image, by erase block, instead of describing this one",
+    )
     inspect.set_defaults(func=cmd_inspect)
 
     restore = sub.add_parser(
