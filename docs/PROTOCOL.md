@@ -262,6 +262,48 @@ The boot partition is special in HiBurn: it is written straight from
 
 Finally, `reset`.
 
+## The agent U-Boot writes to flash when it starts
+
+This one costs data, so it is worth stating plainly.
+
+HiSilicon's U-Boot carries a modified `set_default_env()` in
+`common/env_common.c`, which mainline does not:
+
+```c
+gd->flags |= GD_FLG_ENV_READY;
+gd->flags |= GD_FLG_ENV_DEFAULT;
+saveenv();          /* unconditional */
+```
+
+So whenever this U-Boot starts and cannot load a valid environment, it
+**writes a default one to flash** — at its own `CONFIG_ENV_OFFSET`, which for
+OpenIPC's `u-boot-hi3518ev300-universal.bin` is 0x40000, matching the OpenIPC
+16 MB layout (`256k(boot),64k(env),…`).
+
+That is harmless when the camera's layout agrees. It is not harmless
+otherwise. Restore a vendor image whose kernel begins at 0x40000, and the
+next time any host tool loads this U-Boot as its agent, one 64 KiB block of
+that kernel is replaced by a U-Boot environment — recognisable as a CRC32
+followed by NUL-separated `key=value` text:
+
+```
+0x00040000  d0 bf 03 b7 61 72 63 68 3d 61 72 6d 00 62 61 73  |....arch=arm.bas|
+```
+
+Two consequences:
+
+- **Verify in the same session as the write.** The environment save happens at
+  U-Boot startup, before any of the tool's own writes, so what a restore
+  writes is intact at the end of that session. A *later* session damages the
+  image before it can read it — which makes a standalone verify of a foreign
+  layout report a difference it caused itself. `restore --verify` exists for
+  this.
+- **A camera left in that state may not boot**, because the block holding the
+  kernel's uImage header is gone. Re-restore before relying on it.
+
+Nothing here is specific to this tool: any host tool that loads this U-Boot to
+reach the flash has the same effect, HiTool included.
+
 ## Provenance
 
 | Claim | Basis |

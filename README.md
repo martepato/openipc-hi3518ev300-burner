@@ -286,8 +286,22 @@ hisiburn verify dump.bin --skip 0x40000 --length 0x1f0000   # just the kernel
 it says where in flash that image belongs.
 
 **A camera that has booted will not match a dump of it.** Firmware writes its
-settings partition, and usually the U-Boot environment, on every boot. Those
-regions differing is normal; the kernel and rootfs regions differing is not.
+settings partition on every boot, so that region differing is normal.
+
+**And the agent U-Boot itself writes to flash when it starts.** HiSilicon's
+`set_default_env()` calls `saveenv()` unconditionally, so a U-Boot that cannot
+load a valid environment writes a default one at its own env offset — 0x40000
+for OpenIPC's build. Restore a vendor image whose kernel starts there and the
+next session will overwrite that block before it can read it, making a
+standalone verify report a difference it caused itself. Verify in the same
+session instead:
+
+```sh
+hisiburn restore factory.bin --verify --uboot u-boot-hi3518ev300-universal.bin
+```
+
+The full mechanism is in
+[docs/PROTOCOL.md](docs/PROTOCOL.md#the-agent-u-boot-writes-to-flash-when-it-starts).
 
 ### Looking at individual bytes
 

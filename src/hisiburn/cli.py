@@ -531,11 +531,33 @@ def cmd_restore(args: argparse.Namespace) -> int:
         run_restore(
             agent, data, staging=args.staging, on_step=step,
             on_progress=ProgressBar("upload"), chunk_size=args.chunk,
-            reset=not args.no_reset,
+            reset=False,
         )
+
+        mismatches = []
+        if args.verify:
+            # Verifying here, in the same session, is the only reading that
+            # can be trusted: the agent U-Boot writes its own environment to
+            # flash when it starts, so a later session damages the image
+            # before it can measure it.
+            print("\nVerifying, in the same session:")
+            mismatches = verify_against_image(
+                agent, data, staging=args.staging, on_step=step,
+                chunk_size=args.chunk,
+            )
+        if not args.no_reset:
+            step("resetting the camera")
+            agent.reset()
     finally:
         pipe.close()
 
+    if mismatches:
+        print(f"\n{len(mismatches)} region(s) did not verify:")
+        for mismatch in mismatches:
+            print(f"  {mismatch}")
+        return 1
+    if args.verify:
+        print("\nVerified: flash matches the image byte for byte.")
     print("\nDone. The camera should reboot into the restored firmware.")
     return 0
 
@@ -831,6 +853,11 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument(
         "--staging", type=lambda v: int(v, 0), default=0x41000000,
         metavar="ADDR", help="DRAM address to stage through",
+    )
+    restore.add_argument(
+        "--verify", action="store_true",
+        help="check the write in the same session, before anything reboots "
+             "(the only reading that can be trusted — see the README)",
     )
     restore.add_argument("--dry-run", action="store_true", help="print the plan only")
     restore.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
