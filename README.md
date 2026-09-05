@@ -271,11 +271,23 @@ with usbtftp.
   read [########----------------]  33.4%  5600 KiB   15.8 KiB/s  11.8 min left
 ```
 
-**This is slow, unavoidably.** The burn agent has no device-to-host bulk
-transfer unless U-Boot was built with `usbtftp` (OpenIPC's is not — `hisiburn
-info` will say). So the bytes come back as hex text in command replies, about
-32 per 2 ms round trip. A whole 16 MiB chip is roughly 18 minutes; a single
-partition is seconds to a couple of minutes:
+**Speed depends entirely on the U-Boot you load.** OpenIPC's release has no
+`usbtftp`, so the bytes come back as hex text in command replies — 32 per
+round trip, which is *hours* for a 16 MiB chip. Build the agent U-Boot once
+and the same backup takes under a minute:
+
+```sh
+./tools/build-agent-uboot.sh
+hisiburn backup mycamera.bin --uboot output/u-boot-hi3518ev300-agent.bin
+```
+
+See [docs/AGENT-UBOOT.md](docs/AGENT-UBOOT.md) — it also removes the
+`saveenv()` that otherwise costs you an erase block every session. `hisiburn
+inspect <u-boot.bin>` reports which capabilities a given build has, and
+`hisiburn info` reports what the running one has.
+
+The slow path still works where you have no built U-Boot, and a single
+partition is tolerable on it:
 
 ```sh
 hisiburn backup settings.bin --offset 0xf90000 --length 0x70000    # ~30 s

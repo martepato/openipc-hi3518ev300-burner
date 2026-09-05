@@ -658,3 +658,99 @@ def test_backup_rejects_a_zero_length(pipe, tmp_path):
         with pytest.raises(PlanError, match="length must be positive"):
             run_backup(BurnAgent(pipe), handle, offset=0, length=0,
                        staging=0x41000000, on_step=lambda _: None)
+
+
+# --- the fast read path, where usbtftp exists -------------------------------
+
+
+def _queue_usbtftp(pipe, payload: bytes, frame_len: int = 16384):
+    """Frames a U-Boot with usbtftp serves for one read request."""
+    pipe.queue(b"\xfe" + len(payload).to_bytes(4, "big") + frame_len.to_bytes(4, "big"))
+    for i in range(0, len(payload), frame_len):
+        pipe.queue(b"\xda" + payload[i : i + frame_len])
+    pipe.queue(b"\xed")
+    pipe.queue_command_ok()  # the `usbtftp end` that releases the device
+
+
+def test_usbtftp_read_reassembles_the_frames(pipe):
+    from hisiburn.agent import BurnAgent
+
+    payload = bytes(range(256)) * 40  # 10 KiB
+    _queue_usbtftp(pipe, payload, frame_len=4096)
+    assert BurnAgent(pipe).usbtftp_read(0x40000, len(payload)) == payload
+
+    sent = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
+    assert sent[0] == f"usbtftp 0x40000 backup.bin 0x{len(payload):x}"
+    assert sent[-1] == "usbtftp end", "the device must be let out of its loop"
+
+
+def test_usbtftp_read_takes_the_frame_size_from_the_device(pipe):
+    """The vendor uses 200-byte frames; a rebuilt U-Boot may use far more."""
+    from hisiburn.agent import BurnAgent
+
+    payload = b"\xa5" * 600
+    _queue_usbtftp(pipe, payload, frame_len=200)
+    assert BurnAgent(pipe).usbtftp_read(0, len(payload)) == payload
+    assert sum(1 for f in pipe.writes if f == b"\xfb") == 5  # head, 3 data, tail
+
+
+def test_usbtftp_read_rejects_a_short_transfer(pipe):
+    from hisiburn.agent import AgentError, BurnAgent
+
+    pipe.queue(b"\xfe" + (1024).to_bytes(4, "big") + (256).to_bytes(4, "big"))
+    pipe.queue(b"\xda" + b"\x00" * 256)
+    pipe.queue(b"\xed")  # ends early, having announced 1024
+    pipe.queue_command_ok()
+    with pytest.raises(AgentError, match="not the 1024 it announced"):
+        BurnAgent(pipe).usbtftp_read(0, 1024)
+
+
+def test_usbtftp_read_releases_the_device_even_on_failure(pipe):
+    from hisiburn.agent import AgentError, BurnAgent
+
+    pipe.queue(b"\x99")  # a frame type that means nothing
+    pipe.queue_command_ok()
+    with pytest.raises(AgentError, match="unexpected frame"):
+        BurnAgent(pipe).usbtftp_read(0, 64)
+    sent = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
+    assert sent[-1] == "usbtftp end"
+
+
+def test_backup_uses_the_bulk_path_when_asked(pipe, tmp_path):
+    import zlib
+
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_backup
+
+    payload = bytes(range(256)) * 16  # 4 KiB
+    pipe.queue_command_ok()  # sf probe
+    _queue_usbtftp(pipe, payload, frame_len=1024)
+    pipe.queue_command_ok()  # sf read, for the checksum
+    pipe.queue_command_ok(f"crc32 ==> {zlib.crc32(payload):08x}\r\n")
+
+    out = tmp_path / "dump.bin"
+    with out.open("wb") as handle:
+        run_backup(BurnAgent(pipe), handle, offset=0, length=len(payload),
+                   staging=0x41000000, on_step=lambda _: None,
+                   chunk_size=len(payload), bulk=True)
+    assert out.read_bytes() == payload
+    # No hex dumps: that is the whole point of this path.
+    assert not any(f[3:].startswith(b"md.b") for f in pipe.writes if f[:1] == b"\xab")
+
+
+def test_the_bulk_path_is_still_checksum_verified(pipe, tmp_path):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_backup
+
+    payload = b"\x5a" * 1024
+    pipe.queue_command_ok()
+    for _ in range(2):  # both attempts get a checksum that does not match
+        _queue_usbtftp(pipe, payload, frame_len=1024)
+        pipe.queue_command_ok()
+        pipe.queue_command_ok("crc32 ==> deadbeef\r\n")
+
+    with (tmp_path / "d.bin").open("wb") as handle:
+        with pytest.raises(PlanError, match="corrupted in transit"):
+            run_backup(BurnAgent(pipe), handle, offset=0, length=len(payload),
+                       staging=0x41000000, on_step=lambda _: None,
+                       chunk_size=len(payload), bulk=True)

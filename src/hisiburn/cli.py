@@ -16,6 +16,7 @@ from hisiburn.agent import AgentError, BurnAgent
 from hisiburn.bootrom import PROFILES, BootRom, BootRomError
 from hisiburn.flash import (
     BACKUP_CHUNK,
+    BACKUP_CHUNK_BULK,
     RESTORE_CHUNK,
     VERIFY_CHUNK,
     PlanError,
@@ -30,7 +31,7 @@ from hisiburn.flash import (
 )
 from hisiburn.hitool_log import LogParseError, layout_from_log, parse_sessions
 from hisiburn.hitool_xml import XmlParseError, find_partition_table, layout_from_xml
-from hisiburn.image import describe_comparison, inspect_image
+from hisiburn.image import describe_comparison, inspect_image, inspect_uboot
 from hisiburn.layout import BUILTIN_LAYOUTS, FlashLayout, LayoutError, get_layout
 from hisiburn.usbdev import (
     BackendMissing,
@@ -471,6 +472,23 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         print(describe_comparison(path, other))
         return 0
 
+    uboot = inspect_uboot(path.read_bytes())
+    if uboot is not None:
+        print(f"{path.name}: {path.stat().st_size:,} bytes")
+        print(f"verdict: a U-Boot image — {uboot['version']}")
+        if uboot["compressed"]:
+            print("         (SPL plus a gzip-compressed U-Boot; searched inflated)")
+        print()
+        print("capabilities:")
+        for name, (found, description) in uboot["capabilities"].items():
+            mark = "yes" if found else "NO "
+            print(f"  {mark}  {name:<12} {description}")
+        if not uboot["capabilities"]["usbtftp"][0]:
+            print()
+            print("Without usbtftp there is no bulk read-back, so `hisiburn backup`")
+            print("falls back to md.b — correct and checksummed, but ~18 min for 16 MiB.")
+        return 0
+
     print(inspect_image(path).describe())
     return 0
 
@@ -705,13 +723,19 @@ def cmd_backup(args: argparse.Namespace) -> int:
                 )
             length = chip_size - args.offset
 
-        trips = -(-length // 32)
-        print(
-            f"Reading {length:,} bytes from 0x{args.offset:X}. This path moves "
-            f"32 bytes per round trip,\nso expect roughly "
-            f"{trips * 2.0 / 1000 / 60:.0f} minutes — it is the only way back "
-            "without a U-Boot built with usbtftp."
-        )
+        bulk = not args.no_bulk and agent.has_command("usbtftp")
+        chunk = args.chunk or (BACKUP_CHUNK_BULK if bulk else BACKUP_CHUNK)
+        if bulk:
+            step("usbtftp is available — using the bulk read path")
+        else:
+            trips = -(-length // 32)
+            print(
+                f"This U-Boot has no usbtftp, so the read falls back to hex "
+                f"dumps: 32 bytes per\nround trip, about "
+                f"{trips * 7.0 / 1000 / 60:.0f} minutes for {length:,} bytes. "
+                "A U-Boot built with usbtftp\nreads the same flash in well "
+                "under a minute — see docs/AGENT-UBOOT.md."
+            )
 
         mode = "r+b" if resume_from else "wb"
         with destination.open(mode) as handle:
@@ -719,8 +743,8 @@ def cmd_backup(args: argparse.Namespace) -> int:
             written = run_backup(
                 agent, handle, offset=args.offset, length=length,
                 staging=args.staging, on_step=step,
-                on_progress=Meter("read"), chunk_size=args.chunk,
-                resume_from=resume_from,
+                on_progress=Meter("read"), chunk_size=chunk,
+                resume_from=resume_from, bulk=bulk,
             )
     finally:
         pipe.close()
@@ -989,8 +1013,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="how much to read (default: to the end of the chip)",
     )
     backup.add_argument(
-        "--chunk", type=lambda v: int(v, 0), default=BACKUP_CHUNK, metavar="BYTES",
-        help="how much to stage and checksum at a time (default 64 KiB)",
+        "--chunk", type=lambda v: int(v, 0), metavar="BYTES",
+        help="how much to read and checksum at a time "
+             "(default 128 KiB over usbtftp, 64 KiB without it)",
+    )
+    backup.add_argument(
+        "--no-bulk", action="store_true",
+        help="force the slow hex-dump path even where usbtftp is available",
     )
     backup.add_argument(
         "--staging", type=lambda v: int(v, 0), default=0x41000000, metavar="ADDR",

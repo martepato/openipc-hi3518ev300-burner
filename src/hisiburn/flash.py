@@ -520,6 +520,11 @@ def _explain(agent: BurnAgent, mismatch: Mismatch, staging: int) -> Mismatch:
 #: smaller chunk means less to redo when one fails its checksum.
 BACKUP_CHUNK = 64 * 1024
 
+#: Chunk for the `usbtftp` path. Bounded by U-Boot's heap, not the protocol:
+#: the read is served from a malloc of exactly this size, against a
+#: CONFIG_SYS_MALLOC_LEN of 384 KiB on this board.
+BACKUP_CHUNK_BULK = 128 * 1024
+
 
 def run_backup(
     agent: BurnAgent,
@@ -531,6 +536,7 @@ def run_backup(
     on_progress: ProgressCallback | None = None,
     chunk_size: int = BACKUP_CHUNK,
     resume_from: int = 0,
+    bulk: bool = False,
 ) -> int:
     """Read flash back to a file, through U-Boot's `md.b`.
 
@@ -559,6 +565,24 @@ def run_backup(
         label = f"0x{flash_offset:07X}"
 
         for attempt in range(2):
+            if bulk:
+                piece = agent.usbtftp_read(
+                    flash_offset, want,
+                    on_progress=(
+                        lambda done, _total, base=position: on_progress(
+                            base + done, length
+                        )
+                    ) if on_progress else None,
+                )
+                # The same range, checksummed by the device, to check the
+                # transfer rather than trusting it.
+                agent.flash_read(staging, flash_offset, want)
+                expected = agent.crc32(staging, want)
+                if zlib.crc32(piece) & 0xFFFFFFFF == expected:
+                    break
+                on_step(f"{label}: checksum mismatch, re-reading (attempt {attempt + 1})")
+                continue
+
             agent.flash_read(staging, flash_offset, want)
             expected = agent.crc32(staging, want)
             piece = agent.read_memory(

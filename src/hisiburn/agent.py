@@ -370,6 +370,82 @@ class BurnAgent:
                 on_progress(len(out), count)
         return bytes(out[:count])
 
+    def usbtftp_read(
+        self,
+        offset: int,
+        length: int,
+        on_progress: ProgressCallback | None = None,
+        timeout_ms: int = 30_000,
+    ) -> bytes:
+        """Read flash over the agent's bulk upload path.
+
+        Present only in a U-Boot built with `usbtftp`. The device answers each
+        request frame with one bulk transfer, so this moves whole kilobytes per
+        round trip rather than the 32 bytes a hex dump manages.
+
+        The command that starts it never replies: `do_usbtftp_upload()` blocks
+        inside its own USB event loop until told to stop, and the reply frames
+        are served from in there. So it is sent without waiting, and released
+        afterwards with `usbtftp end`.
+        """
+        self.pipe.write(
+            protocol.command_frame(f"usbtftp 0x{offset:x} backup.bin 0x{length:x}")
+        )
+
+        out = bytearray()
+        frame_len: int | None = None
+        total: int | None = None
+        try:
+            while True:
+                self.pipe.write(protocol.request_frame())
+                # Ask for exactly what the next frame should hold: a transfer
+                # that happens to be a multiple of the packet size ends with no
+                # short packet, and a read sized by guesswork would hang.
+                if frame_len is None or total is None:
+                    want = 512
+                else:
+                    want = min(frame_len, total - len(out)) + 1
+                data = self.pipe.read(max(want, 512), timeout_ms=timeout_ms)
+                if not data:
+                    raise AgentError("empty frame during a usbtftp read")
+
+                kind = data[0]
+                if kind == protocol.OP_HEAD:
+                    total = int.from_bytes(data[1:5], "big")
+                    frame_len = int.from_bytes(data[5:9], "big")
+                    log.debug("usbtftp: %d bytes in %d-byte frames", total, frame_len)
+                elif kind == protocol.OP_DATA:
+                    out += data[1:]
+                    if on_progress and total:
+                        on_progress(min(len(out), total), total)
+                elif kind == protocol.OP_TAIL:
+                    # Always read through to the tail rather than stopping on a
+                    # byte count: leaving a frame unread desynchronises the pipe
+                    # for whatever runs next.
+                    break
+                else:
+                    raise AgentError(f"unexpected frame 0x{kind:02x} during a read")
+
+                if total is not None and len(out) > total:
+                    raise AgentError(
+                        f"usbtftp sent {len(out)} bytes, more than the {total} "
+                        "it announced"
+                    )
+        finally:
+            # Let the device out of its event loop whatever happened, or it
+            # sits there until its own five-second idle timeout.
+            try:
+                self.pipe.write(protocol.command_frame("usbtftp end"))
+                self.pipe.read(timeout_ms=2000)
+            except (UsbError, AgentError) as exc:
+                log.debug("could not close the usbtftp session: %s", exc)
+
+        if total is not None and len(out) != total:
+            raise AgentError(
+                f"usbtftp returned {len(out)} bytes, not the {total} it announced"
+            )
+        return bytes(out[:length])
+
     def has_command(self, name: str) -> bool:
         """Whether U-Boot knows a command, asked without provoking a failure.
 

@@ -501,3 +501,63 @@ def classify_block(data: bytes) -> str:
     if _looks_like_uboot_env(data):
         return "U-Boot environment"
     return "unrecognised content"
+
+
+# --- what a U-Boot image can do ---------------------------------------------
+
+#: Capabilities worth knowing about before pointing this tool at a camera,
+#: and a string that is present in a build that has each. Help text is used
+#: where a bare command name is too short to search for reliably.
+UBOOT_CAPABILITIES: tuple[tuple[str, bytes, str], ...] = (
+    ("usbtftp", b"usbtftp", "bulk flash read-back — fast backup"),
+    ("crc32", b"checksum calculation", "on-device checksums — verify"),
+    ("md", b"memory display", "memory dump — slow backup, and peek"),
+    ("mw", b"memory write", "memory write — staging a flash write"),
+    ("getinfo", b"getinfo", "HiSilicon burn-agent extensions"),
+    ("burn agent", b"start download process.", "the USB download loop itself"),
+)
+
+_UBOOT_VERSION = re.compile(rb"U-Boot 20\d\d\.\d\d[^\x00\n]{0,40}")
+
+
+def uboot_payload(data: bytes) -> bytes | None:
+    """Decompress the U-Boot inside a mini-boot image.
+
+    These images are an SPL followed by a gzip-compressed U-Boot, so almost
+    nothing interesting is visible without inflating it first.
+    """
+    import zlib
+
+    for offset in range(0, min(len(data), ERASE_BLOCK * 4) - 3):
+        if data[offset : offset + 3] != GZIP_MAGIC:
+            continue
+        try:
+            return zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(data[offset:])
+        except zlib.error:
+            continue
+    return None
+
+
+def inspect_uboot(data: bytes) -> dict | None:
+    """Report a U-Boot image's version and the capabilities this tool cares about.
+
+    Answers "can this U-Boot back up flash?" from the binary itself, which is
+    the only authority — a config file in a source tree need not be the one a
+    release was built from.
+    """
+    payload = uboot_payload(data)
+    haystack = (payload or b"") + data
+    match = _UBOOT_VERSION.search(haystack)
+    if match is None:
+        return None
+
+    present = {}
+    for name, needle, description in UBOOT_CAPABILITIES:
+        # The gadget keeps some strings as UTF-16, so check both encodings.
+        found = needle in haystack or needle.decode().encode("utf-16-le") in haystack
+        present[name] = (found, description)
+    return {
+        "version": match.group().decode("ascii", "replace").strip(),
+        "compressed": payload is not None,
+        "capabilities": present,
+    }
