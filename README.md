@@ -49,6 +49,27 @@ uv tool install git+https://github.com/martepato/openipc-hi3518ev300-burner
 clone. Git installs pin a commit, so `hisiburn --version` reports which one;
 `uv tool install --force` or `pip install --force-reinstall` moves it forward.
 
+## Getting a firmware to flash
+
+If you already have a build, skip ahead. If not,
+**[openipc-hi3518ev300-wifi-setup](https://github.com/martepato/openipc-hi3518ev300-wifi-setup)**
+produces one — and gives the camera something worth reflashing for: Wi-Fi you
+set up from your phone. A freshly flashed camera broadcasts `OpenIPC-A1B2`;
+join it, pick your network from a list, type the password, and it joins that
+network on every boot from then on.
+
+```sh
+git clone https://github.com/martepato/openipc-hi3518ev300-wifi-setup.git
+cd openipc-hi3518ev300-wifi-setup
+./tools/build-image.sh          # writes ./output/release/
+```
+
+It layers onto OpenIPC's official release rather than rebuilding it, so the
+kernel and bootloader come out byte-identical to upstream and only the root
+filesystem differs. What it writes to `output/release/` is what `flash`
+expects: the four images, a `usb-burn.xml` partition table and a
+`sha256sums.txt`.
+
 ## Flashing a build
 
 Point it at the build's output directory:
