@@ -62,6 +62,17 @@ A fifth edit is incidental: `usb_stop()` belongs to the USB host stack that
 step 1 deliberately leaves out, so its call is dropped. The PHY is already
 quiesced by the `phy_hiusb_init()` above it.
 
+## Checking a build
+
+`hisiburn inspect <u-boot.bin>` reads the capabilities out of the binary, and
+that is the only sound way to get them: a running U-Boot cannot be asked what
+commands it has. `help <name>` returns failure whether or not the command
+exists, and printing its help overruns a fixed 200-byte buffer on the device.
+See [PROTOCOL.md](PROTOCOL.md#never-ask-the-device-what-commands-it-has).
+
+So `backup` decides which path to use from the image passed to `--uboot`. With
+no `--uboot`, the running U-Boot is an unknown and the slow path is used.
+
 ## Is it safe to run an unofficial U-Boot?
 
 It only ever executes from RAM. The boot ROM is in mask ROM and cannot be

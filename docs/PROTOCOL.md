@@ -215,6 +215,42 @@ The banner can be asked for again. `usb3_do_set_config()` re-sends it on each
 SET_CONFIGURATION, so a missed read is recoverable by re-issuing the request
 rather than being mistaken for a boot ROM.
 
+### Never ask the device what commands it has
+
+There is no safe way, and two separate reasons.
+
+`help <name>` cannot answer it. `cmd_usage()` returns 1 unconditionally and
+`_do_help()` ORs that into its result, so `help` reports **failure whether the
+command exists or not**:
+
+```c
+if (cmdtp != NULL)
+        rcode |= cmd_usage(cmdtp);   /* cmd_usage() always returns 1 */
+else {
+        printf("Unknown command '%s' ...");
+        rcode = 1;
+}
+```
+
+And trying it costs the session. `cmd_usage()` prints the name, the usage line
+and the whole multi-line help, each through `udc_puts()`:
+
+```c
+void udc_puts(const char *s)
+{
+    if (strlen(s) > 200) return;
+    else { if (usb_out_open == 1) strcat(tx_state, s); }
+}
+```
+
+`tx_state` is `char[200]`. The guard checks the length of *each* string, never
+the running total, so several printfs of help text **overrun the buffer on the
+device** and it stops responding. Observed: `help usbtftp` against a U-Boot
+that does have `usbtftp`, followed by a write timeout on the next command.
+
+Read capabilities out of the U-Boot image instead — the host loaded it, so it
+has the bytes. `hisiburn inspect <u-boot.bin>` does exactly that.
+
 ### Never send an opcode the device may not implement
 
 `usb3_handle_protocol()` is a chain of `if`/`else if` on the opcode byte **with

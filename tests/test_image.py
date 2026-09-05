@@ -416,3 +416,41 @@ def test_text_without_an_assignment_is_not_an_environment():
     from hisiburn.image import classify_block
 
     assert classify_block(b"\x00" * 4 + b"just some plain text here" * 2) != "U-Boot environment"
+
+
+def test_capabilities_come_from_the_image(tmp_path):
+    """Which is the only safe place to get them: the device cannot be asked."""
+    import gzip
+
+    from hisiburn.image import inspect_uboot
+
+    payload = (
+        b"U-Boot 2016.11-g131d3f2\x00"
+        b"usbtftp\x00download or upload image using USB protocol\x00"
+        b"checksum calculation\x00memory display\x00memory write\x00"
+        b"getinfo\x00start download process.\x00"
+    )
+    image = b"\x15\x05\x00\xea" + b"\xff" * 60 + gzip.compress(payload)
+    report = inspect_uboot(image)
+    assert report is not None
+    assert report["version"].startswith("U-Boot 2016.11")
+    assert report["compressed"]
+    assert all(found for found, _ in report["capabilities"].values())
+
+
+def test_a_build_without_usbtftp_is_reported_as_such(tmp_path):
+    import gzip
+
+    from hisiburn.image import inspect_uboot
+
+    payload = b"U-Boot 2016.11-g131d3f2\x00checksum calculation\x00memory display\x00"
+    image = b"\x15\x05\x00\xea" + b"\xff" * 60 + gzip.compress(payload)
+    report = inspect_uboot(image)
+    assert not report["capabilities"]["usbtftp"][0]
+    assert report["capabilities"]["crc32"][0]
+
+
+def test_a_non_uboot_file_reports_nothing(tmp_path):
+    from hisiburn.image import inspect_uboot
+
+    assert inspect_uboot(b"\x00" * 4096) is None

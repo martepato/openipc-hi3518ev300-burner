@@ -446,16 +446,13 @@ class BurnAgent:
             )
         return bytes(out[:length])
 
-    def has_command(self, name: str) -> bool:
-        """Whether U-Boot knows a command, asked without provoking a failure.
-
-        `help <name>` succeeds when the command exists and fails when it does
-        not, which matters because the device discards console output on the
-        failure path -- running the command itself tells you nothing, since
-        both "unknown command" and a usage message come back as a bare
-        [EOT](ERROR).
-        """
-        return self.try_command(f"help {name}").ok
+    # There is deliberately no "does this U-Boot have command X" probe.
+    # `help <name>` cannot answer it: cmd_usage() returns 1 unconditionally and
+    # _do_help ORs that in, so help reports failure whether the command exists
+    # or not. Worse, it prints the full multi-line help through udc_puts(),
+    # which strcats into a fixed 200-byte buffer without a bounds check -- long
+    # help overruns it and the device stops responding. Capabilities are read
+    # from the U-Boot image instead; see hisiburn.image.inspect_uboot.
 
     def reset(self) -> None:
         """Reboot the camera. The device drops off the bus, which is success."""

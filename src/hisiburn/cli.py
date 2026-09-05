@@ -326,22 +326,22 @@ def _describe_pipe(pipe: BulkPipe) -> None:
 
 
 def cmd_info(args: argparse.Namespace) -> int:
-    pipe, agent = connect_agent(
-        args.pid, args.wait, resolve_uboot(args.uboot), args.chip
-    )
+    uboot = resolve_uboot(args.uboot)
+    pipe, agent = connect_agent(args.pid, args.wait, uboot, args.chip)
     try:
         for topic in ("version", "bootmode", "spi"):
             value = " ".join(agent.get_info(topic).split())
             print(f"{topic:<10} {value}")
-        # Whether a full backup is possible at all comes down to this one
-        # command, and asking via `help` avoids the failure path that would
-        # discard the answer.
-        available = agent.has_command("usbtftp")
-        if available:
-            print(f"{'usbtftp':<10} available — flash read-back is possible")
-        else:
-            print(f"{'usbtftp':<10} not built in — flash read-back needs a U-Boot")
-            print(f"{'':<10} built with CONFIG_CMD_USB=y")
+        # Capabilities come from the U-Boot image, not the device: a running
+        # U-Boot cannot be asked what commands it has without wedging it.
+        if uboot is not None:
+            capabilities = inspect_uboot(uboot.data)
+            if capabilities:
+                found = capabilities["capabilities"]["usbtftp"][0]
+                print(f"{'usbtftp':<10} {'yes' if found else 'no'} (from {uboot.label})")
+                if not found:
+                    print(f"{'':<10} flash read-back will use the slow path;")
+                    print(f"{'':<10} see docs/AGENT-UBOOT.md")
     finally:
         pipe.close()
     return 0
@@ -705,9 +705,8 @@ def cmd_backup(args: argparse.Namespace) -> int:
             "start over."
         )
 
-    pipe, agent = connect_agent(
-        args.pid, args.wait, resolve_uboot(args.uboot), args.chip
-    )
+    uboot = resolve_uboot(args.uboot)
+    pipe, agent = connect_agent(args.pid, args.wait, uboot, args.chip)
     try:
         info = agent.get_info("spi")
         step(f"flash: {' '.join(info.split())}")
@@ -723,17 +722,28 @@ def cmd_backup(args: argparse.Namespace) -> int:
                 )
             length = chip_size - args.offset
 
-        bulk = not args.no_bulk and agent.has_command("usbtftp")
+        # Read the capability from the image we loaded, never from the device:
+        # there is no safe way to ask a running U-Boot what commands it has.
+        capabilities = inspect_uboot(uboot.data) if uboot else None
+        has_usbtftp = bool(
+            capabilities and capabilities["capabilities"]["usbtftp"][0]
+        )
+        bulk = has_usbtftp and not args.no_bulk
         chunk = args.chunk or (BACKUP_CHUNK_BULK if bulk else BACKUP_CHUNK)
         if bulk:
-            step("usbtftp is available — using the bulk read path")
+            step(f"{uboot.label} has usbtftp — using the bulk read path")
         else:
             trips = -(-length // 32)
+            why = (
+                "no --uboot was given, so the running U-Boot's capabilities are "
+                "unknown"
+                if capabilities is None
+                else f"{uboot.label} has no usbtftp"
+            )
             print(
-                f"This U-Boot has no usbtftp, so the read falls back to hex "
-                f"dumps: 32 bytes per\nround trip, about "
-                f"{trips * 7.0 / 1000 / 60:.0f} minutes for {length:,} bytes. "
-                "A U-Boot built with usbtftp\nreads the same flash in well "
+                f"{why}, so the read falls back to hex dumps:\n32 bytes per round "
+                f"trip, about {trips * 7.0 / 1000 / 60:.0f} minutes for "
+                f"{length:,} bytes. An agent U-Boot reads the\nsame flash in well "
                 "under a minute — see docs/AGENT-UBOOT.md."
             )
 

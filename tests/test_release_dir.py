@@ -512,25 +512,18 @@ def test_read_memory_explains_a_uboot_without_md(pipe):
         BurnAgent(pipe).read_memory(0x41000000, 16)
 
 
-def test_has_command_asks_via_help(pipe):
+def test_nothing_probes_the_device_for_its_command_set():
+    """`help` cannot answer it and wedges the device trying.
+
+    cmd_usage() returns 1 unconditionally and _do_help ORs it in, so
+    `help <name>` reports failure whether the command exists or not. It also
+    prints the full multi-line help through udc_puts(), which strcats into a
+    fixed 200-byte buffer with no bounds check -- long help overruns it and the
+    agent stops responding. Capabilities come from the image instead.
+    """
     from hisiburn.agent import BurnAgent
 
-    # Running the command itself tells you nothing: the device discards
-    # console output on the failure path, so an unknown command and a usage
-    # message both come back as a bare [EOT](ERROR).
-    pipe.queue_command_ok("usbtftp - download or upload image using USB\r\n")
-    assert BurnAgent(pipe).has_command("usbtftp")
-    assert pipe.writes[0][3:].decode() == "help usbtftp"
-
-
-def test_has_command_is_false_when_help_fails(pipe):
-    from hisiburn.agent import BurnAgent
-
-    pipe.queue_command_error()
-    assert not BurnAgent(pipe).has_command("usbtftp")
-
-
-# --- reading flash back to the host -----------------------------------------
+    assert not hasattr(BurnAgent, "has_command")
 
 
 def _queue_backup_chunk(pipe, payload: bytes, base: int = 0x41000000, crc=None):
