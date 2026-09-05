@@ -223,6 +223,24 @@ directory to find one in — so a full dump supplies its own, from the
 bootloader at its offset 0. `--uboot PATH` overrides that, and a U-Boot
 sitting next to the image is preferred over the embedded one.
 
+### Verifying what is actually on the camera
+
+```sh
+hisiburn verify mjsxj02hl_full-dump_4.0.5-0105_sign.bin
+```
+
+```
+  0x0000000..0x0400000: ok (3f2a91c4)
+  0x0400000..0x0800000: ok (b71de055)
+  ...
+Match: the camera's flash is byte-identical to mjsxj02hl_full-dump_4.0.5-0105_sign.bin.
+```
+
+Each chunk is read into DRAM and checksummed **on the device**; only the
+checksum crosses USB. That makes it fast — a whole 16 MiB chip is four round
+trips — and, more usefully, it works on a U-Boot with no device-to-host bulk
+path at all. `--offset` verifies an image that starts part-way into the chip.
+
 ### Recovering a layout from a HiBurn log
 
 If you have no partition table but have flashed this camera from Windows

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import zlib
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -407,3 +408,66 @@ def run_restore(
     if reset:
         on_step("resetting the camera")
         agent.reset()
+
+
+# --- verifying flash against a local image ----------------------------------
+
+#: How much to check at a time. `sf read` lands straight in DRAM without
+#: going through U-Boot's small heap, so this is bounded by memory, not by
+#: CONFIG_SYS_MALLOC_LEN the way a `usbtftp` read would be.
+VERIFY_CHUNK = 4 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class Mismatch:
+    """A region whose contents on the camera differ from the local image."""
+
+    offset: int
+    length: int
+    expected: int
+    actual: int
+
+    def __str__(self) -> str:
+        return (
+            f"0x{self.offset:07X}..0x{self.offset + self.length:07X}  "
+            f"expected {self.expected:08x}, camera has {self.actual:08x}"
+        )
+
+
+def verify_against_image(
+    agent: BurnAgent,
+    data: bytes,
+    staging: int,
+    on_step: StepCallback,
+    offset: int = 0,
+    chunk_size: int = VERIFY_CHUNK,
+) -> list[Mismatch]:
+    """Compare flash against ``data`` by checksum, without reading it back.
+
+    Each chunk is read into DRAM and checksummed on the device; only the
+    checksum crosses USB. That makes this usable on a U-Boot with no
+    device-to-host bulk path at all, and fast — a whole 16 MiB chip is four
+    round trips rather than eighty thousand.
+    """
+    if not data:
+        raise PlanError("refusing to verify against an empty image")
+
+    agent.flash_probe()
+    mismatches: list[Mismatch] = []
+
+    for position in range(0, len(data), chunk_size):
+        piece = data[position : position + chunk_size]
+        flash_offset = offset + position
+        label = f"0x{flash_offset:07X}..0x{flash_offset + len(piece):07X}"
+
+        agent.flash_read(staging, flash_offset, len(piece))
+        actual = agent.crc32(staging, len(piece))
+        expected = zlib.crc32(piece) & 0xFFFFFFFF
+
+        if actual == expected:
+            on_step(f"{label}: ok ({expected:08x})")
+        else:
+            on_step(f"{label}: MISMATCH (expected {expected:08x}, got {actual:08x})")
+            mismatches.append(Mismatch(flash_offset, len(piece), expected, actual))
+
+    return mismatches

@@ -258,3 +258,90 @@ def test_restore_rejects_an_empty_image(pipe):
 
     with pytest.raises(PlanError, match="empty image"):
         run_restore(BurnAgent(pipe), b"", staging=0x41000000, on_step=lambda _: None)
+
+
+# --- verifying flash without reading it back --------------------------------
+
+
+def test_verify_reports_a_match(pipe):
+    import zlib
+
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import verify_against_image
+
+    data = bytes(range(256)) * 4096  # 1 MiB
+    pipe.queue_command_ok()  # sf probe
+    pipe.queue_command_ok()  # sf read
+    pipe.queue_command_ok(f"crc32 for 41000000 ... ==> {zlib.crc32(data):08x}\r\n")
+
+    steps = []
+    assert verify_against_image(BurnAgent(pipe), data, 0x41000000, steps.append,
+                                chunk_size=len(data)) == []
+    assert any(": ok" in line for line in steps)
+
+
+def test_verify_reports_a_mismatch_with_both_checksums(pipe):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import verify_against_image
+
+    data = b"\xa5" * 4096
+    pipe.queue_command_ok()
+    pipe.queue_command_ok()
+    pipe.queue_command_ok("crc32 for 41000000 ... ==> deadbeef\r\n")
+
+    mismatches = verify_against_image(BurnAgent(pipe), data, 0x41000000,
+                                      lambda _: None, chunk_size=len(data))
+    assert len(mismatches) == 1
+    assert mismatches[0].actual == 0xDEADBEEF
+    assert mismatches[0].offset == 0
+
+
+def test_verify_sends_read_then_crc_per_chunk(pipe):
+    import zlib
+
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import verify_against_image
+
+    data = b"\x5a" * 8192
+    chunk = 4096
+    pipe.queue_command_ok()
+    for index in range(2):
+        piece = data[index * chunk : (index + 1) * chunk]
+        pipe.queue_command_ok()
+        pipe.queue_command_ok(f"crc32 for x ... ==> {zlib.crc32(piece):08x}\r\n")
+
+    verify_against_image(BurnAgent(pipe), data, 0x41000000, lambda _: None,
+                         chunk_size=chunk)
+    sent = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
+    assert sent == [
+        "sf probe 0",
+        "sf read 0x41000000 0x0 0x1000",
+        "crc32 0x41000000 0x1000",
+        "sf read 0x41000000 0x1000 0x1000",
+        "crc32 0x41000000 0x1000",
+    ]
+
+
+def test_verify_honours_a_flash_offset(pipe):
+    import zlib
+
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import verify_against_image
+
+    data = b"\x11" * 4096
+    pipe.queue_command_ok()
+    pipe.queue_command_ok()
+    pipe.queue_command_ok(f"crc32 for x ... ==> {zlib.crc32(data):08x}\r\n")
+
+    verify_against_image(BurnAgent(pipe), data, 0x41000000, lambda _: None,
+                         offset=0x350000, chunk_size=len(data))
+    sent = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
+    assert "sf read 0x41000000 0x350000 0x1000" in sent
+
+
+def test_a_uboot_without_crc32_is_explained(pipe):
+    from hisiburn.agent import AgentError, BurnAgent
+
+    pipe.queue_command_ok("Unknown command 'crc32' - try 'help'\r\n")
+    with pytest.raises(AgentError, match="CONFIG_CMD_CRC32"):
+        BurnAgent(pipe).crc32(0x41000000, 4096)

@@ -17,6 +17,7 @@ just the console sequence a HiBurn log shows:
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable
 
@@ -60,6 +61,14 @@ def memset_command(address: int, value: int, length: int) -> str:
 
 def probe_command(bus: int = 0) -> str:
     return f"sf probe {bus}"
+
+
+def read_command(address: int, offset: int, length: int) -> str:
+    return f"sf read 0x{address:x} 0x{offset:x} 0x{length:x}"
+
+
+def crc32_command(address: int, length: int) -> str:
+    return f"crc32 0x{address:x} 0x{length:x}"
 
 
 def erase_command(offset: int, length: int) -> str:
@@ -287,6 +296,31 @@ class BurnAgent:
         return self.command(
             write_command(address, offset, length), timeout_ms=flash_timeout_ms(length)
         )
+
+    def flash_read(self, address: int, offset: int, length: int) -> str:
+        """Read flash into DRAM. The data stays on the device."""
+        return self.command(
+            read_command(address, offset, length), timeout_ms=flash_timeout_ms(length)
+        )
+
+    def crc32(self, address: int, length: int) -> int:
+        """CRC-32 of a DRAM range, as U-Boot computes it.
+
+        U-Boot's crc32 is the standard one, so the result compares directly
+        against :func:`zlib.crc32`. This is the only way to check flash
+        contents against a local file on a U-Boot without `usbtftp`: the
+        bytes never leave the device, just a checksum of them.
+        """
+        output = self.command(
+            crc32_command(address, length), timeout_ms=flash_timeout_ms(length)
+        )
+        match = re.search(r"==>\s*([0-9a-fA-F]{1,8})", output)
+        if not match:
+            raise AgentError(
+                f"could not read a checksum out of {output!r}. If U-Boot says the "
+                "command is unknown, this build has CONFIG_CMD_CRC32 disabled."
+            )
+        return int(match.group(1), 16)
 
     def reset(self) -> None:
         """Reboot the camera. The device drops off the bus, which is success."""

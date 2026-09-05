@@ -14,11 +14,13 @@ from hisiburn.agent import AgentError, BurnAgent
 from hisiburn.bootrom import PROFILES, BootRom, BootRomError
 from hisiburn.flash import (
     RESTORE_CHUNK,
+    VERIFY_CHUNK,
     PlanError,
     build_plan,
     find_uboot,
     run_plan,
     run_restore,
+    verify_against_image,
     verify_checksums,
     verify_flash_chip,
 )
@@ -536,6 +538,37 @@ def _uboot_for_restore(
     return None
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    path = Path(args.image)
+    if not path.is_file():
+        raise CliError(f"image not found: {path}")
+    data = path.read_bytes()
+
+    print(f"Verifying the camera against {path.name} ({len(data):,} bytes)")
+    uboot = load_uboot(Path(args.uboot)) if args.uboot else find_uboot(path.parent)
+    if uboot is not None and not isinstance(uboot, UbootImage):
+        uboot = load_uboot(uboot)
+
+    pipe, agent = connect_agent(args.pid, args.wait, uboot=uboot, chip=args.chip)
+    try:
+        print()
+        mismatches = verify_against_image(
+            agent, data, staging=args.staging, on_step=step,
+            offset=args.offset, chunk_size=args.chunk,
+        )
+    finally:
+        pipe.close()
+
+    print()
+    if not mismatches:
+        print(f"Match: the camera's flash is byte-identical to {path.name}.")
+        return 0
+    print(f"{len(mismatches)} region(s) differ:")
+    for mismatch in mismatches:
+        print(f"  {mismatch}")
+    return 1
+
+
 def cmd_from_log(args: argparse.Namespace) -> int:
     path = Path(args.log)
     sessions = parse_sessions(path.read_text(errors="replace"))
@@ -729,6 +762,25 @@ def build_parser() -> argparse.ArgumentParser:
              "or does not match the chip size",
     )
     restore.set_defaults(func=cmd_restore)
+
+    verify = sub.add_parser(
+        "verify", parents=[general, device, booting],
+        help="check the camera's flash against a local image, by checksum",
+    )
+    verify.add_argument("image", help="image the flash should match")
+    verify.add_argument(
+        "--offset", type=lambda v: int(v, 0), default=0, metavar="ADDR",
+        help="flash offset the image starts at (default 0)",
+    )
+    verify.add_argument(
+        "--chunk", type=lambda v: int(v, 0), default=VERIFY_CHUNK, metavar="BYTES",
+        help="how much to check at a time (default 4 MiB)",
+    )
+    verify.add_argument(
+        "--staging", type=lambda v: int(v, 0), default=0x41000000, metavar="ADDR",
+        help="DRAM address to read through",
+    )
+    verify.set_defaults(func=cmd_verify)
 
     from_log = sub.add_parser(
         "from-log", parents=[general],
