@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from hisiburn import __version__
+from hisiburn import version_string
 from hisiburn.agent import AgentError, BurnAgent
 from hisiburn.bootrom import PROFILES, BootRom, BootRomError
 from hisiburn.flash import (
@@ -914,7 +914,7 @@ def build_parser() -> argparse.ArgumentParser:
             "An open replacement for HiTool/HiBurn that needs no driver install."
         ),
     )
-    parser.add_argument("--version", action="version", version=f"hisiburn {__version__}")
+    parser.add_argument("--version", action="version", version=version_string())
 
     sub = parser.add_subparsers(dest="command", required=True)
 

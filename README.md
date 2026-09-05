@@ -83,6 +83,22 @@ Or from a clone, for development:
 pip install -e '.[dev]'
 ```
 
+**Both git installs pin a commit and do not follow the branch afterwards**, so
+an installed copy can be well behind without anything saying so — the version
+number does not change between commits. `hisiburn --version` reports what it
+was pinned to:
+
+```
+hisiburn 0.1.0 (git c65a1d799e58)
+```
+
+To move it forward:
+
+```sh
+uv tool install --force git+https://github.com/martepato/openipc-hi3518ev300-burner
+pip install --force-reinstall git+https://github.com/martepato/openipc-hi3518ev300-burner
+```
+
 ## Use
 
 ### 1. Get the camera into download mode

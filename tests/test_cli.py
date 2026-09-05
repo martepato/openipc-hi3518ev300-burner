@@ -524,3 +524,57 @@ def test_the_missing_uboot_message_names_the_env_var(capsys, pipe, monkeypatch, 
     pipe.queue_timeout(4)
     assert main(["run", "usbtftp"]) == 1
     assert UBOOT_ENV_VAR in capsys.readouterr().err
+
+
+# --- saying which build is installed ----------------------------------------
+
+
+def _fake_direct_url(monkeypatch, payload):
+    """Stand in for the PEP 610 record an installer writes."""
+    import hisiburn
+
+    class _Distribution:
+        @staticmethod
+        def from_name(_name):
+            class _D:
+                @staticmethod
+                def read_text(name):
+                    return payload if name == "direct_url.json" else None
+
+            return _D()
+
+    import importlib.metadata
+
+    monkeypatch.setattr(importlib.metadata, "Distribution", _Distribution)
+    return hisiburn
+
+
+def test_a_git_install_reports_the_commit_it_was_pinned_to(monkeypatch):
+    """A version number alone cannot say how far behind a git install is."""
+    hisiburn = _fake_direct_url(
+        monkeypatch,
+        '{"url": "https://github.com/o/r", "vcs_info": '
+        '{"vcs": "git", "commit_id": "c65a1d799e587986539954a833241dbdf8254be4"}}',
+    )
+    assert hisiburn.installed_from() == "git c65a1d799e58"
+    assert hisiburn.version_string().endswith("(git c65a1d799e58)")
+
+
+def test_an_editable_install_says_so(monkeypatch):
+    hisiburn = _fake_direct_url(
+        monkeypatch,
+        '{"url": "file:///home/me/repo", "dir_info": {"editable": true}}',
+    )
+    assert hisiburn.installed_from() == "editable file:///home/me/repo"
+
+
+def test_a_plain_install_reports_only_the_version(monkeypatch):
+    hisiburn = _fake_direct_url(monkeypatch, None)
+    assert hisiburn.installed_from() is None
+    assert hisiburn.version_string() == f"hisiburn {hisiburn.__version__}"
+
+
+def test_a_broken_direct_url_record_is_not_fatal(monkeypatch):
+    """Reporting a version must never be the thing that fails a command."""
+    hisiburn = _fake_direct_url(monkeypatch, "{not json")
+    assert hisiburn.installed_from() is None
