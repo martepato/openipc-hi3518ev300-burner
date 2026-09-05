@@ -48,13 +48,14 @@ Unplug it, hold the reset button, plug the USB cable back in while still
 holding, and keep holding for a couple of seconds.
 
 ```sh
-hisiburn probe --wait 30
+hisiburn probe
 ```
 
-`--wait` starts scanning first, so you can run the command and *then* do the
-unplug/hold-reset/replug dance — handy, because the download-mode window is
-short. All of `--verbose`, `--wait` and `--pid` work on either side of the
-subcommand.
+Every command that touches the camera **waits up to 30 seconds for it by
+default**, so you can start the command and *then* do the
+unplug/hold-reset/replug dance. `--wait 0` fails immediately instead;
+`--wait 60` gives you longer. All of `--verbose`, `--wait` and `--pid` work on
+either side of the subcommand.
 
 ```
 Found 1 HiSilicon device(s):
@@ -114,9 +115,9 @@ camera halted afterwards.
 
 ### Recovering a layout from a HiBurn log
 
-If you have flashed this camera from Windows before, the HiTool log is a
-complete partition table for it — offsets, sizes and image names. Turn it into
-a layout rather than guessing:
+If you have no partition table but have flashed this camera from Windows
+before, the HiTool log is one — offsets, sizes and image names. Turn it into a
+layout rather than guessing:
 
 ```sh
 hisiburn from-log hiburn.log                    # show it

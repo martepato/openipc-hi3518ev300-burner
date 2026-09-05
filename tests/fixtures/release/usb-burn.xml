@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="GB2312" ?>
+<Partition_Info ProgrammerFile="">
+<Part Sel="1" PartitionName="fastboot" FlashType="spi" FileSystem="none" Start="0K" Length="256K" SelectFile="u-boot-hi3518ev300-universal.bin"/>
+<Part Sel="1" PartitionName="env" FlashType="spi" FileSystem="none" Start="256K" Length="64K" SelectFile="env.bin"/>
+<Part Sel="1" PartitionName="kernel" FlashType="spi" FileSystem="none" Start="320K" Length="3072K" SelectFile="uImage.hi3518ev300"/>
+<Part Sel="1" PartitionName="rootfs" FlashType="spi" FileSystem="none" Start="3392K" Length="10240K" SelectFile="rootfs.squashfs.hi3518ev300"/>
+<Part Sel="1" PartitionName="rootfs_data" FlashType="spi" FileSystem="none" Start="13632K" Length="2752K" SelectFile=""/>
+</Partition_Info>

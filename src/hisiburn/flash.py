@@ -11,7 +11,9 @@ finishes, so a missing file or an oversized rootfs has to be caught up front.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -111,11 +113,11 @@ def build_plan(
     overrides = overrides or {}
 
     if only:
-        unknown = only - {p.name for p in layout.partitions}
-        if unknown:
-            raise PlanError(
-                f"layout {layout.name!r} has no partition(s): {', '.join(sorted(unknown))}"
-            )
+        try:
+            # "boot" and "fastboot" name the same region; accept either.
+            only = layout.resolve_names(only)
+        except LayoutError as exc:
+            raise PlanError(str(exc)) from exc
 
     jobs: list[PartitionJob] = []
     missing: list[str] = []
@@ -127,15 +129,19 @@ def build_plan(
         source: Path | None = None
         if partition.name in overrides:
             source = overrides[partition.name]
-        elif partition.image:
-            source = directory / partition.image
+        elif partition.candidates:
+            # Builds disagree on filenames -- OpenIPC ships U-Boot as
+            # `u-boot-<soc>-universal.bin`, older guides as `u-boot.bin`.
+            found = [directory / name for name in partition.candidates]
+            source = next((path for path in found if path.is_file()), found[0])
 
         if source is None:
             jobs.append(PartitionJob(partition=partition, image_path=None, image_size=0))
             continue
 
         if not source.is_file():
-            missing.append(f"{partition.name}: {source}")
+            names = " or ".join(partition.candidates) or source.name
+            missing.append(f"{partition.name}: {names}")
             continue
 
         size = source.stat().st_size
@@ -149,11 +155,13 @@ def build_plan(
         jobs.append(PartitionJob(partition=partition, image_path=source, image_size=size))
 
     if missing:
+        available = sorted(p.name for p in directory.iterdir() if p.is_file())[:12]
         raise PlanError(
             "missing image file(s):\n  "
             + "\n  ".join(missing)
-            + f"\nLooked in {directory}. Use --image NAME=PATH to point at a file "
-            "with a different name."
+            + f"\nLooked in {directory}, which holds: "
+            + (", ".join(available) if available else "nothing")
+            + "\nUse --image NAME=PATH to point a partition at a specific file."
         )
 
     if not jobs:
@@ -227,3 +235,67 @@ def run_plan(
     if reset:
         on_step("resetting the camera")
         agent.reset()
+
+
+# --- checksum verification --------------------------------------------------
+
+#: Digest files a build might ship next to its images, strongest first.
+CHECKSUM_FILES = {"sha256sums.txt": hashlib.sha256, "md5sums.txt": hashlib.md5}
+
+_DIGEST_LINE = re.compile(r"^([0-9a-fA-F]{32,64})\s+[* ]?(.+)$")
+
+
+def find_checksums(directory: Path) -> tuple[Path, object] | None:
+    """The strongest digest file a firmware directory ships, if any."""
+    for name, algorithm in CHECKSUM_FILES.items():
+        path = Path(directory) / name
+        if path.is_file():
+            return path, algorithm
+    return None
+
+
+def verify_checksums(plan: FlashPlan, directory: Path, on_step: StepCallback) -> None:
+    """Check the images against a digest file the build shipped.
+
+    A truncated download is the cheapest possible way to brick a camera, and
+    the check costs a second. Images the digest file does not mention are left
+    alone -- it is a manifest, not an allowlist.
+    """
+    found = find_checksums(directory)
+    if found is None:
+        on_step("no checksum file alongside the images; skipping verification")
+        return
+    path, algorithm = found
+
+    expected: dict[str, str] = {}
+    for line in path.read_text(errors="replace").splitlines():
+        match = _DIGEST_LINE.match(line.strip())
+        if match:
+            expected[match.group(2).strip()] = match.group(1).lower()
+
+    checked, mismatched = 0, []
+    for job in plan.jobs:
+        if job.image_path is None:
+            continue
+        want = expected.get(job.image_path.name)
+        if want is None:
+            continue
+        digest = algorithm()
+        with job.image_path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != want:
+            mismatched.append(job.image_path.name)
+        checked += 1
+
+    if mismatched:
+        raise PlanError(
+            f"{path.name} does not match: {', '.join(mismatched)}. "
+            "The image is corrupt or was rebuilt without refreshing the digests; "
+            "flashing it would brick the camera. Re-download, or pass --no-verify "
+            "if you know the digest file is stale."
+        )
+    if checked:
+        on_step(f"{checked} image(s) match {path.name}")
+    else:
+        on_step(f"{path.name} lists none of these images; skipping verification")

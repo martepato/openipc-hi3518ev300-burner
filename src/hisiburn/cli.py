@@ -11,8 +11,15 @@ from pathlib import Path
 from hisiburn import __version__
 from hisiburn.agent import AgentError, BurnAgent
 from hisiburn.bootrom import PROFILES, BootRom, BootRomError
-from hisiburn.flash import PlanError, build_plan, run_plan, verify_flash_chip
+from hisiburn.flash import (
+    PlanError,
+    build_plan,
+    run_plan,
+    verify_checksums,
+    verify_flash_chip,
+)
 from hisiburn.hitool_log import LogParseError, layout_from_log, parse_sessions
+from hisiburn.hitool_xml import XmlParseError, find_partition_table, layout_from_xml
 from hisiburn.layout import BUILTIN_LAYOUTS, FlashLayout, LayoutError, get_layout
 from hisiburn.usbdev import (
     BackendMissing,
@@ -25,6 +32,15 @@ from hisiburn.usbdev import (
 )
 
 log = logging.getLogger("hisiburn")
+
+#: Used only when nothing better is available: no --layout given, and no
+#: partition table alongside the images.
+DEFAULT_LAYOUT = "mjsxj02hl-16m"
+
+#: Every device command waits by default. Getting a camera into download mode
+#: means unplugging it, holding reset and plugging back in, which no one can do
+#: before the command starts. Waiting is the normal case; `--wait 0` opts out.
+DEFAULT_WAIT = 30.0
 
 
 class CliError(Exception):
@@ -68,7 +84,15 @@ class ProgressBar:
 
 
 def open_pipe(product_id: int | None, wait: float) -> BulkPipe:
-    device = wait_for_device(product_id, timeout=wait) if wait else find_device(product_id)
+    if not wait:
+        return BulkPipe(find_device(product_id))
+    try:
+        device = find_device(product_id)
+    except DeviceNotFound:
+        print(
+            f"Waiting up to {wait:.0f}s for the camera — plug it in now, holding reset..."
+        )
+        device = wait_for_device(product_id, timeout=wait)
     return BulkPipe(device)
 
 
@@ -99,8 +123,8 @@ def cmd_probe(args: argparse.Namespace) -> int:
 
     devices = scan()
     if not devices and args.wait:
-        # The download-mode window is short, so let the user start the scan and
-        # then do the unplug/hold-reset/replug dance.
+        # The download-mode window is short, so the scan starts first and the
+        # user does the unplug/hold-reset/replug dance while it runs.
         print(f"Waiting up to {args.wait:.0f}s — plug the camera in now (holding reset)...")
         deadline = time.monotonic() + args.wait
         while not devices and time.monotonic() < deadline:
@@ -118,10 +142,6 @@ def cmd_probe(args: argparse.Namespace) -> int:
         print()
         print("macOS needs no driver for this — if nothing appears, the camera is")
         print("not entering download mode rather than being unsupported.")
-        if not args.wait:
-            print()
-            print("Tip: `hisiburn probe --wait 30` starts scanning first, so you can")
-            print("run it and then do the unplug/hold-reset/replug dance.")
         return 1
 
     print(f"Found {len(devices)} HiSilicon device(s):")
@@ -258,12 +278,26 @@ def cmd_boot(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_layout(args: argparse.Namespace) -> FlashLayout:
+def _resolve_layout(args: argparse.Namespace) -> tuple[FlashLayout, str]:
+    """Pick a layout and say where it came from.
+
+    A partition table shipped next to the images beats any built-in guess: it
+    was written by whoever built that firmware and names its actual files.
+    """
     if args.layout_file:
-        return FlashLayout.load(Path(args.layout_file))
+        path = Path(args.layout_file)
+        if path.suffix.lower() == ".xml":
+            return layout_from_xml(path), f"{path}"
+        return FlashLayout.load(path), f"{path}"
     if args.from_log:
-        return layout_from_log(Path(args.from_log))
-    return get_layout(args.layout)
+        return layout_from_log(Path(args.from_log)), f"HiBurn log {args.from_log}"
+    if args.layout:
+        return get_layout(args.layout), f"built-in layout {args.layout!r}"
+
+    table = find_partition_table(Path(args.dir))
+    if table is not None:
+        return layout_from_xml(table), f"{table.name} in {args.dir}"
+    return get_layout(DEFAULT_LAYOUT), f"built-in layout {DEFAULT_LAYOUT!r}"
 
 
 def _parse_overrides(values: list[str] | None) -> dict[str, Path]:
@@ -277,15 +311,18 @@ def _parse_overrides(values: list[str] | None) -> dict[str, Path]:
 
 
 def cmd_flash(args: argparse.Namespace) -> int:
-    layout = _resolve_layout(args)
+    layout, source = _resolve_layout(args)
+    print(f"Layout: {source}")
     plan = build_plan(
         layout,
         Path(args.dir),
-        only=set(args.only) if args.only else None,
+        only=layout.resolve_names(set(args.only)) if args.only else None,
         overrides=_parse_overrides(args.image),
     )
 
     print(plan.describe())
+    if not args.no_verify:
+        verify_checksums(plan, Path(args.dir), step)
 
     if args.dry_run:
         print("\nCommands that would be sent:")
@@ -359,7 +396,7 @@ def cmd_layouts(args: argparse.Namespace) -> int:
 #: shares one action object between the top-level parser and every subparser,
 #: so setting a default on the parser would also overwrite it on the copies and
 #: undo the SUPPRESS that keeps them from clobbering each other.
-SHARED_DEFAULTS = {"verbose": False, "pid": None, "wait": 0.0}
+SHARED_DEFAULTS = {"verbose": False, "pid": None, "wait": DEFAULT_WAIT}
 
 
 def _shared_options() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
@@ -383,7 +420,8 @@ def _shared_options() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]
     )
     device.add_argument(
         "--wait", type=float, default=argparse.SUPPRESS, metavar="SECONDS",
-        help="wait this long for the device to appear instead of failing immediately",
+        help=f"seconds to wait for the camera to appear (default {DEFAULT_WAIT:.0f}; "
+             "0 fails immediately)",
     )
     return general, device
 
@@ -433,8 +471,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="write a firmware set to the camera's flash",
     )
     flash.add_argument("-d", "--dir", default=".", help="directory holding the images")
-    flash.add_argument("-l", "--layout", default="mjsxj02hl-16m", help="built-in layout name")
-    flash.add_argument("--layout-file", help="JSON layout produced by `hisiburn from-log -o`")
+    flash.add_argument(
+        "-l", "--layout",
+        help=f"built-in layout name (default: the partition table found next to "
+             f"the images, else {DEFAULT_LAYOUT!r})",
+    )
+    flash.add_argument(
+        "--layout-file",
+        help="partition table to use: a HiTool .xml, or JSON from `from-log -o`",
+    )
     flash.add_argument("--from-log", help="derive the layout from a HiBurn log")
     flash.add_argument(
         "--only", nargs="+", metavar="NAME", help="flash only these partitions"
@@ -448,6 +493,10 @@ def build_parser() -> argparse.ArgumentParser:
     flash.add_argument("--dry-run", action="store_true", help="print commands, touch nothing")
     flash.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
     flash.add_argument("--no-reset", action="store_true", help="leave the camera halted")
+    flash.add_argument(
+        "--no-verify", action="store_true",
+        help="skip checking the images against a shipped md5sums/sha256sums file",
+    )
     flash.set_defaults(func=cmd_flash)
 
     from_log = sub.add_parser(
@@ -484,6 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     except (
         BackendMissing,
         CliError,
+        XmlParseError,
         PlanError,
         LayoutError,
         LogParseError,

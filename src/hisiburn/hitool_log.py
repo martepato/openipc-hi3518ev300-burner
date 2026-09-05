@@ -142,7 +142,9 @@ def _name_for(job: _Job, index: int) -> str:
     if job.name:
         return job.name
     if job.erase_offset == 0:
-        return "boot"
+        # HiBurn does not print a name for the bootloader slot; HiTool tables
+        # and U-Boot's own mtdparts call it "fastboot" and "boot" respectively.
+        return "fastboot"
     return f"part{index}_0x{job.erase_offset:x}"
 
 

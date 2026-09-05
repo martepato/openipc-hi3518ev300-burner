@@ -7,7 +7,7 @@ from hisiburn.layout import get_layout
 
 EXPECTED = [
     # name, offset, size, image
-    ("boot", 0x000000, 0x040000, "u-boot.bin"),
+    ("fastboot", 0x000000, 0x040000, "u-boot.bin"),
     ("env", 0x040000, 0x010000, "env.bin"),
     ("kernel", 0x050000, 0x300000, "uImage.hi3518ev300"),
     ("rootfs", 0x350000, 0xA00000, "rootfs.squashfs.hi3518ev300"),
@@ -43,7 +43,7 @@ def test_boot_partition_is_marked_as_written_from_ram(fixture_log):
     # The boot slot has no download of its own — HiBurn writes it from the
     # U-Boot the boot ROM already staged at 0x41000000.
     layout = layout_from_log(fixture_log)
-    assert layout.get("boot").from_staged_uboot
+    assert layout.get("fastboot").from_staged_uboot
     assert not layout.get("env").from_staged_uboot
 
 

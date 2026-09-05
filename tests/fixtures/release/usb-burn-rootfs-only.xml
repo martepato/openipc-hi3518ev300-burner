@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="GB2312" ?>
+<Partition_Info ProgrammerFile="">
+<Part Sel="1" PartitionName="rootfs" FlashType="spi" FileSystem="none" Start="3392K" Length="10240K" SelectFile="rootfs.squashfs.hi3518ev300"/>
+</Partition_Info>

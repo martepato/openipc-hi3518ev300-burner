@@ -2,7 +2,7 @@
 
 import pytest
 
-from hisiburn.cli import main
+from hisiburn.cli import DEFAULT_WAIT, main
 
 
 @pytest.fixture
@@ -96,13 +96,13 @@ def test_verbose_is_accepted_on_either_side_of_the_subcommand(argv):
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["-v", "probe"], {"verbose": True, "wait": 0.0, "pid": None}),
-        (["probe", "-v"], {"verbose": True, "wait": 0.0, "pid": None}),
-        (["probe"], {"verbose": False, "wait": 0.0, "pid": None}),
+        (["-v", "probe"], {"verbose": True, "wait": DEFAULT_WAIT, "pid": None}),
+        (["probe", "-v"], {"verbose": True, "wait": DEFAULT_WAIT, "pid": None}),
+        (["probe"], {"verbose": False, "wait": DEFAULT_WAIT, "pid": None}),
         (["--wait", "5", "probe"], {"verbose": False, "wait": 5.0, "pid": None}),
         (["probe", "--wait", "5"], {"verbose": False, "wait": 5.0, "pid": None}),
-        (["--pid", "0xd001", "info"], {"verbose": False, "wait": 0.0, "pid": 0xD001}),
-        (["info", "--pid", "0xd001"], {"verbose": False, "wait": 0.0, "pid": 0xD001}),
+        (["--pid", "0xd001", "info"], {"verbose": False, "wait": DEFAULT_WAIT, "pid": 0xD001}),
+        (["info", "--pid", "0xd001"], {"verbose": False, "wait": DEFAULT_WAIT, "pid": 0xD001}),
         (["-v", "--wait", "3", "flash"], {"verbose": True, "wait": 3.0, "pid": None}),
         (["flash", "--verbose", "--wait", "3"], {"verbose": True, "wait": 3.0, "pid": None}),
         (["-v", "boot", "-f", "x.bin", "--wait", "9"],
@@ -153,12 +153,24 @@ def test_missing_libusb_is_explained_rather_than_traced(capsys, monkeypatch):
     assert "not a problem with the camera" in err
 
 
-def test_probe_reports_nothing_found_with_a_wait_tip(capsys, monkeypatch):
+def test_probe_reports_nothing_found(capsys, monkeypatch):
     monkeypatch.setattr("hisiburn.cli.list_devices", lambda: [])
-    assert main(["probe"]) == 1
+    # --wait 0 opts out of the default wait so the test does not sleep.
+    assert main(["probe", "--wait", "0"]) == 1
     out = capsys.readouterr().out
     assert "No HiSilicon USB device found" in out
-    assert "--wait 30" in out, "should suggest the flag that helps here"
+    assert "hold the reset button" in out
+
+
+def test_device_commands_wait_by_default():
+    # Getting a camera into download mode takes both hands and a few seconds,
+    # which nobody can do before the command starts.
+    from hisiburn.cli import build_parser
+
+    for argv in (["probe"], ["info"], ["flash"], ["boot", "-f", "x.bin"]):
+        args = build_parser().parse_args(argv)
+        assert not hasattr(args, "wait") or args.wait == DEFAULT_WAIT
+    assert DEFAULT_WAIT == 30.0
 
 
 def test_probe_waits_for_a_device_to_appear(capsys, monkeypatch):

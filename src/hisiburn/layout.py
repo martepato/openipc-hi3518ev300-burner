@@ -38,9 +38,18 @@ class Partition:
     offset: int
     size: int
     image: str | None = None
-    #: Set for the boot partition, which is written from the U-Boot image
+    #: Other filenames that may hold this image. OpenIPC's U-Boot ships as
+    #: `u-boot-<soc>-universal.bin`, but plenty of guides and older builds call
+    #: it `u-boot.bin`, and either should just work.
+    alternatives: tuple[str, ...] = ()
+    #: Set for the bootloader partition, which HiBurn writes from the U-Boot
     #: already staged in RAM rather than from a separate download.
     from_staged_uboot: bool = False
+
+    @property
+    def candidates(self) -> tuple[str, ...]:
+        """Filenames to look for, most canonical first."""
+        return ((self.image,) if self.image else ()) + self.alternatives
 
     @property
     def end(self) -> int:
@@ -82,11 +91,24 @@ class FlashLayout:
                 )
             previous = partition
 
+    #: Names people use interchangeably for the same region. U-Boot's own
+    #: mtdparts calls the bootloader slot "boot"; HiTool tables call it
+    #: "fastboot".
+    ALIASES = {"boot": "fastboot", "fastboot": "boot", "uboot": "fastboot"}
+
     def get(self, name: str) -> Partition:
+        wanted = {name, self.ALIASES.get(name, name)}
         for partition in self.partitions:
-            if partition.name == name:
+            if partition.name in wanted:
                 return partition
-        raise LayoutError(f"no partition named {name!r} in layout {self.name!r}")
+        raise LayoutError(
+            f"no partition named {name!r} in layout {self.name!r} "
+            f"(it has: {', '.join(p.name for p in self.partitions)})"
+        )
+
+    def resolve_names(self, names: set[str]) -> set[str]:
+        """Map user-supplied partition names onto this layout's own spelling."""
+        return {self.get(name).name for name in names}
 
     def check_fits(self, name: str, image_size: int) -> None:
         """Reject an image too big for its partition, before anything is erased."""
@@ -119,6 +141,7 @@ class FlashLayout:
                         "offset": p.offset,
                         "size": p.size,
                         "image": p.image,
+                        "alternatives": list(p.alternatives),
                         "from_staged_uboot": p.from_staged_uboot,
                     }
                     for p in self.partitions
@@ -141,6 +164,7 @@ class FlashLayout:
                     offset=p["offset"],
                     size=p["size"],
                     image=p.get("image"),
+                    alternatives=tuple(p.get("alternatives", ())),
                     from_staged_uboot=p.get("from_staged_uboot", False),
                 )
                 for p in raw["partitions"]
@@ -159,7 +183,12 @@ MJSXJ02HL_16M = FlashLayout(
     flash_size=16 * 1024 * 1024,
     notes="Xiaomi MJSXJ02HL / Hi3518EV300, 16 MiB NOR (EN25QH128A)",
     partitions=(
-        Partition("boot", 0x000000, 0x040000, image="u-boot.bin", from_staged_uboot=True),
+        Partition(
+            "fastboot", 0x000000, 0x040000,
+            image="u-boot-hi3518ev300-universal.bin",
+            alternatives=("u-boot.bin", "u-boot-hi3518ev300.bin"),
+            from_staged_uboot=True,
+        ),
         Partition("env", 0x040000, 0x010000, image="env.bin"),
         Partition("kernel", 0x050000, 0x300000, image="uImage.hi3518ev300"),
         Partition("rootfs", 0x350000, 0xA00000, image="rootfs.squashfs.hi3518ev300"),
