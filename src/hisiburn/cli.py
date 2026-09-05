@@ -899,7 +899,8 @@ def _shared_options() -> tuple[
     booting.add_argument(
         "--uboot", metavar="PATH",
         help="U-Boot to load if the camera is still in its boot ROM "
-             "(default: the bootloader image in the firmware directory)",
+             "(default: $HISIBURN_UBOOT, a U-Boot beside the image or in the "
+             "working directory, or the one inside a whole-chip dump)",
     )
     booting.add_argument(
         "-c", "--chip", default=DEFAULT_CHIP,
@@ -1053,7 +1054,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument(
         "--chunk", type=lambda v: int(v, 0), metavar="BYTES",
         help="how much to read and checksum at a time "
-             "(default 128 KiB over usbtftp, 64 KiB without it)",
+             "(default 1 MiB over usbtftp, 64 KiB without it)",
     )
     backup.add_argument(
         "--no-bulk", action="store_true",
