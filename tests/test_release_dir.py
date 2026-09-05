@@ -399,3 +399,67 @@ def test_verify_rejects_a_skip_past_the_end(pipe):
     with pytest.raises(PlanError, match="past the end"):
         verify_against_image(BurnAgent(pipe), b"x" * 1024, 0x41000000,
                              lambda _: None, skip=4096)
+
+
+# --- reading bytes back without usbtftp -------------------------------------
+
+
+def test_memory_dump_parsing_ignores_the_ascii_column():
+    from hisiburn.agent import parse_memory_dump
+
+    # The ASCII column can contain things that look like hex bytes, so the
+    # parser anchors on the address prefix rather than scanning for pairs.
+    text = (
+        "41000000: 27 05 19 56 63 fd 39 c1 5e 98 76 aa 00 1d 40 5a    '..Vc.9.^.v...@Z\r\n"
+        "41000010: 61 62 63 64 65 66 30 31 32 33 34 35 36 37 38 39    abcdef0123456789\r\n"
+    )
+    data = parse_memory_dump(text)
+    assert len(data) == 32
+    assert data[:4].hex() == "27051956"
+    assert data[16:32] == b"abcdef0123456789"
+
+
+def test_read_memory_stitches_several_dumps(pipe):
+    from hisiburn.agent import BurnAgent
+
+    def dump(base, payload):
+        lines = []
+        for i in range(0, len(payload), 16):
+            row = payload[i : i + 16]
+            ascii_col = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+            lines.append(f"{base + i:08x}: {row.hex(' ')}    {ascii_col}")
+        return "\r\n".join(lines) + "\r\n"
+
+    payload = bytes(range(64))
+    pipe.queue_command_ok(dump(0x41000000, payload[:32]))
+    pipe.queue_command_ok(dump(0x41000020, payload[32:]))
+
+    assert BurnAgent(pipe).read_memory(0x41000000, 64) == payload
+    sent = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
+    assert sent == ["md.b 0x41000000 0x20", "md.b 0x41000020 0x20"]
+
+
+def test_read_memory_explains_a_uboot_without_md(pipe):
+    from hisiburn.agent import AgentError, BurnAgent
+
+    pipe.queue_command_ok("Unknown command 'md.b' - try 'help'\r\n")
+    with pytest.raises(AgentError, match="CONFIG_CMD_MEMORY"):
+        BurnAgent(pipe).read_memory(0x41000000, 16)
+
+
+def test_has_command_asks_via_help(pipe):
+    from hisiburn.agent import BurnAgent
+
+    # Running the command itself tells you nothing: the device discards
+    # console output on the failure path, so an unknown command and a usage
+    # message both come back as a bare [EOT](ERROR).
+    pipe.queue_command_ok("usbtftp - download or upload image using USB\r\n")
+    assert BurnAgent(pipe).has_command("usbtftp")
+    assert pipe.writes[0][3:].decode() == "help usbtftp"
+
+
+def test_has_command_is_false_when_help_fails(pipe):
+    from hisiburn.agent import BurnAgent
+
+    pipe.queue_command_error()
+    assert not BurnAgent(pipe).has_command("usbtftp")

@@ -67,6 +67,10 @@ def read_command(address: int, offset: int, length: int) -> str:
     return f"sf read 0x{address:x} 0x{offset:x} 0x{length:x}"
 
 
+def memory_dump_command(address: int, count: int) -> str:
+    return f"md.b 0x{address:x} 0x{count:x}"
+
+
 def crc32_command(address: int, length: int) -> str:
     return f"crc32 0x{address:x} 0x{length:x}"
 
@@ -77,6 +81,19 @@ def erase_command(offset: int, length: int) -> str:
 
 def write_command(address: int, offset: int, length: int) -> str:
     return f"sf write 0x{address:x} 0x{offset:x} 0x{length:x}"
+
+
+#: `md.b` output: an address, a colon, then the bytes, then an ASCII column.
+#: Anchoring on the address keeps ASCII that happens to look like hex out.
+_DUMP_LINE = re.compile(r"^[0-9a-fA-F]+:\s+((?:[0-9a-fA-F]{2}[ \t]+){1,16})", re.MULTILINE)
+
+
+def parse_memory_dump(text: str) -> bytes:
+    """Pull the bytes out of a `md.b` hex dump."""
+    out = bytearray()
+    for match in _DUMP_LINE.finditer(text):
+        out += bytes(int(token, 16) for token in match.group(1).split())
+    return bytes(out)
 
 
 class AgentError(Exception):
@@ -321,6 +338,43 @@ class BurnAgent:
                 "command is unknown, this build has CONFIG_CMD_CRC32 disabled."
             )
         return int(match.group(1), 16)
+
+    #: Bytes per `md.b` call. The agent's reply buffer is 200 bytes and U-Boot
+    #: spends about 70 of them per 16-byte line, so two lines is the most that
+    #: survives without being truncated mid-dump.
+    DUMP_STRIDE = 32
+
+    def read_memory(self, address: int, count: int) -> bytes:
+        """Read DRAM back as text, through U-Boot's `md.b`.
+
+        This is the only way to see actual bytes on a U-Boot without
+        `usbtftp`: they come back as a hex dump in the command reply. It is
+        far too slow for bulk transfer -- tens of bytes per round trip -- but
+        exactly right for looking at a header or a few blocks.
+        """
+        out = bytearray()
+        while len(out) < count:
+            want = min(self.DUMP_STRIDE, count - len(out))
+            text = self.command(memory_dump_command(address + len(out), want))
+            chunk = parse_memory_dump(text)
+            if not chunk:
+                raise AgentError(
+                    f"could not read bytes out of {text!r}. If U-Boot says the "
+                    "command is unknown, this build has CONFIG_CMD_MEMORY disabled."
+                )
+            out += chunk[:want]
+        return bytes(out[:count])
+
+    def has_command(self, name: str) -> bool:
+        """Whether U-Boot knows a command, asked without provoking a failure.
+
+        `help <name>` succeeds when the command exists and fails when it does
+        not, which matters because the device discards console output on the
+        failure path -- running the command itself tells you nothing, since
+        both "unknown command" and a usage message come back as a bare
+        [EOT](ERROR).
+        """
+        return self.try_command(f"help {name}").ok
 
     def reset(self) -> None:
         """Reboot the camera. The device drops off the bus, which is success."""

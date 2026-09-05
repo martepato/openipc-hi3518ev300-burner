@@ -329,6 +329,15 @@ def cmd_info(args: argparse.Namespace) -> int:
         for topic in ("version", "bootmode", "spi"):
             value = " ".join(agent.get_info(topic).split())
             print(f"{topic:<10} {value}")
+        # Whether a full backup is possible at all comes down to this one
+        # command, and asking via `help` avoids the failure path that would
+        # discard the answer.
+        available = agent.has_command("usbtftp")
+        if available:
+            print(f"{'usbtftp':<10} available — flash read-back is possible")
+        else:
+            print(f"{'usbtftp':<10} not built in — flash read-back needs a U-Boot")
+            print(f"{'':<10} built with CONFIG_CMD_USB=y")
     finally:
         pipe.close()
     return 0
@@ -564,6 +573,51 @@ def _uboot_for_restore(
     return None
 
 
+def _hexdump(data: bytes, base: int, other: bytes | None = None) -> str:
+    lines = []
+    for position in range(0, len(data), 16):
+        row = data[position : position + 16]
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        marker = ""
+        if other is not None:
+            expected = other[position : position + 16]
+            marker = "  " if expected == row else "  <- differs"
+        lines.append(
+            f"  0x{base + position:08X}  {row.hex(' '):<47}  |{text:<16}|{marker}"
+        )
+    return "\n".join(lines)
+
+
+def cmd_peek(args: argparse.Namespace) -> int:
+    """Show the actual bytes at a flash offset, for narrowing a mismatch."""
+    expected: bytes | None = None
+    if args.image:
+        path = Path(args.image)
+        if not path.is_file():
+            raise CliError(f"image not found: {path}")
+        blob = path.read_bytes()
+        expected = blob[args.offset : args.offset + args.length]
+
+    pipe, agent = connect_agent(
+        args.pid, args.wait, resolve_uboot(args.uboot), args.chip
+    )
+    try:
+        agent.flash_probe()
+        agent.flash_read(args.staging, args.offset, max(args.length, 0x1000))
+        data = agent.read_memory(args.staging, args.length)
+    finally:
+        pipe.close()
+
+    print(f"\ncamera, flash 0x{args.offset:08X}:")
+    print(_hexdump(data, args.offset, expected))
+    if expected is not None:
+        print(f"\n{Path(args.image).name}, same offset:")
+        print(_hexdump(expected, args.offset, data))
+        print()
+        print("identical" if expected == data else "these differ")
+    return 0
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     path = Path(args.image)
     if not path.is_file():
@@ -787,6 +841,22 @@ def build_parser() -> argparse.ArgumentParser:
              "or does not match the chip size",
     )
     restore.set_defaults(func=cmd_restore)
+
+    peek = sub.add_parser(
+        "peek", parents=[general, device, booting],
+        help="show the bytes at a flash offset, optionally against a local image",
+    )
+    peek.add_argument("offset", type=lambda v: int(v, 0), help="flash offset")
+    peek.add_argument(
+        "-n", "--length", type=lambda v: int(v, 0), default=64, metavar="BYTES",
+        help="how many bytes to show (default 64; this path is slow, keep it small)",
+    )
+    peek.add_argument("--image", help="local image to compare the same offset against")
+    peek.add_argument(
+        "--staging", type=lambda v: int(v, 0), default=0x41000000, metavar="ADDR",
+        help="DRAM address to read through",
+    )
+    peek.set_defaults(func=cmd_peek)
 
     verify = sub.add_parser(
         "verify", parents=[general, device, booting],

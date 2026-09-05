@@ -35,14 +35,48 @@ See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full protocol, including
 [what a source-only reading got wrong](docs/PROTOCOL.md#for-the-record-what-a-source-only-reading-got-wrong)
 before the capture existed.
 
-## Install
+## Requirements
+
+**A U-Boot for your SoC.** This is the one thing you must supply. The camera's
+boot ROM cannot write flash on its own — every operation here first loads a
+U-Boot into RAM and drives that. It is never written to flash, so any build
+for the SoC will do; OpenIPC publishes one per SoC as
+`u-boot-<soc>-universal.bin`:
 
 ```sh
-brew install libusb            # the pyusb backend; the only native dependency
+curl -LO https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-hi3518ev300-universal.bin
+```
+
+`flash` finds it automatically in the firmware directory, and `restore` can
+take one out of a whole-chip dump. `info`, `run`, `peek` and `verify` have
+nowhere to look, so pass `--uboot PATH` (or set `HISIBURN_UBOOT`).
+
+**libusb**, the only native dependency:
+
+```sh
+brew install libusb          # macOS
+sudo apt install libusb-1.0-0    # Debian/Ubuntu
+```
+
+**Python 3.10+.**
+
+## Install
+
+With [uv](https://docs.astral.sh/uv/) — which macOS does not ship, so install
+it first:
+
+```sh
+brew install uv
 uv tool install git+https://github.com/martepato/openipc-hi3518ev300-burner
 ```
 
-Or from a clone:
+Or with pip, into a virtualenv of your choosing:
+
+```sh
+pip install git+https://github.com/martepato/openipc-hi3518ev300-burner
+```
+
+Or from a clone, for development:
 
 ```sh
 pip install -e '.[dev]'
@@ -255,17 +289,24 @@ it says where in flash that image belongs.
 settings partition, and usually the U-Boot environment, on every boot. Those
 regions differing is normal; the kernel and rootfs regions differing is not.
 
-### Pointing commands at a U-Boot
+### Looking at individual bytes
 
-`flash` finds a U-Boot in the firmware directory, and `restore` can take one
-from the dump itself. `info`, `run` and `verify` have neither, so set it once:
+When `verify` flags a block, `peek` shows what is actually there — reading it
+back through U-Boot's `md.b`, which needs no upload path:
 
 ```sh
-export HISIBURN_UBOOT=~/firmware/u-boot-hi3518ev300-universal.bin
+hisiburn peek 0x40000 --image dump.bin --uboot u-boot-hi3518ev300-universal.bin
 ```
 
-Failing that they look in the working directory, and `--uboot PATH` always
-wins.
+```
+camera, flash 0x00040000:
+  0x00040000  27 05 19 56 63 fd 39 c1 ...  |'..Vc.9.....|
+dump.bin, same offset:
+  0x00040000  27 05 19 56 8a 3b 11 02 ...  |'..V.;......|  <- differs
+```
+
+Keep the length small: this path moves tens of bytes per round trip. It is for
+reading a header, not a partition.
 
 ### Recovering a layout from a HiBurn log
 
