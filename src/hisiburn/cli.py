@@ -472,24 +472,29 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         print(describe_comparison(path, other))
         return 0
 
-    uboot = inspect_uboot(path.read_bytes())
-    if uboot is not None:
-        print(f"{path.name}: {path.stat().st_size:,} bytes")
-        print(f"verdict: a U-Boot image — {uboot['version']}")
-        if uboot["compressed"]:
-            print("         (SPL plus a gzip-compressed U-Boot; searched inflated)")
-        print()
-        print("capabilities:")
-        for name, (found, description) in uboot["capabilities"].items():
-            mark = "yes" if found else "NO "
-            print(f"  {mark}  {name:<12} {description}")
-        if not uboot["capabilities"]["usbtftp"][0]:
-            print()
-            print("Without usbtftp there is no bulk read-back, so `hisiburn backup`")
-            print("falls back to md.b — correct and checksummed, but ~18 min for 16 MiB.")
+    # A whole-chip dump begins with a bootloader, so asking "is there a U-Boot
+    # in this file" says nothing about what the file is — every dump answers
+    # yes. Only a file that holds a bootloader and nothing else is a U-Boot.
+    report = inspect_image(path)
+    uboot = inspect_uboot(path.read_bytes()) if report.is_bootloader_only else None
+    if uboot is None:
+        print(report.describe())
         return 0
 
-    print(inspect_image(path).describe())
+    print(f"{path.name}: {path.stat().st_size:,} bytes")
+    print(f"verdict: a U-Boot image — {uboot['version']}")
+    if uboot["compressed"]:
+        print("         (SPL plus a gzip-compressed U-Boot; searched inflated)")
+    print()
+    print("capabilities:")
+    for name, (found, description) in uboot["capabilities"].items():
+        mark = "yes" if found else "NO "
+        print(f"  {mark}  {name:<12} {description}")
+    if not uboot["capabilities"]["usbtftp"][0]:
+        print()
+        print("Without usbtftp there is no bulk read-back, so `hisiburn backup`")
+        print("falls back to md.b — correct and checksummed, but about two hours")
+        print("for 16 MiB. See docs/AGENT-UBOOT.md.")
     return 0
 
 

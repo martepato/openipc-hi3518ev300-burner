@@ -578,3 +578,76 @@ def test_a_broken_direct_url_record_is_not_fatal(monkeypatch):
     """Reporting a version must never be the thing that fails a command."""
     hisiburn = _fake_direct_url(monkeypatch, "{not json")
     assert hisiburn.installed_from() is None
+
+
+# --- inspect telling a dump from a bootloader -------------------------------
+
+
+def test_inspect_reports_a_dump_as_a_dump_not_as_its_bootloader(capsys, tmp_path):
+    """A dump begins with a U-Boot, which is not the same as being one.
+
+    `inspect` used to ask "is there a U-Boot in this file" first, and every
+    whole-chip dump answers yes — so dumps were reported as bootloaders and
+    the contents, partition extents and firmware version were never printed.
+    """
+    dump = _dump_with_bootloader(tmp_path)
+    assert main(["inspect", str(dump)]) == 0
+    out = capsys.readouterr().out
+    assert "full 16 MiB flash dump" in out
+    assert "inferred partition extents" in out
+    assert "a U-Boot image" not in out
+
+
+def test_inspect_reports_a_lone_uboot_as_a_uboot(capsys, tmp_path, monkeypatch):
+    """The other half of the same decision: nothing but a bootloader in it."""
+    import hisiburn.cli as cli
+
+    loader = tmp_path / "u-boot.bin"
+    loader.write_bytes(b"\x00" * 0x2000 + b"\x1f\x8b\x08" + b"\x00" * 0x2000)
+    monkeypatch.setattr(
+        cli,
+        "inspect_uboot",
+        lambda _data: {
+            "version": "U-Boot 2016.11-g131d3f2",
+            "compressed": True,
+            "capabilities": {"usbtftp": (True, "bulk flash read-back — fast backup")},
+        },
+    )
+    assert main(["inspect", str(loader)]) == 0
+    out = capsys.readouterr().out
+    assert "a U-Boot image — U-Boot 2016.11-g131d3f2" in out
+    assert "usbtftp" in out
+
+
+def test_a_dump_shows_its_firmware_version_through_the_cli(capsys, tmp_path):
+    """The library was tested for this; the command someone actually runs
+    was not, which is how the misclassification above went unnoticed."""
+    import struct
+
+    from hisiburn.image import jffs2_header_crc
+
+    def node(nodetype: int, body: bytes) -> bytes:
+        raw = bytearray(12 + len(body))
+        struct.pack_into("<HHI", raw, 0, 0x1985, nodetype, len(raw))
+        struct.pack_into("<I", raw, 8, jffs2_header_crc(bytes(raw[:8])))
+        raw[12:] = body
+        return bytes(raw) + bytes(-len(raw) % 4)
+
+    content = b"ISA_VERSION=4.5.6_0168\n"
+    dirent = bytearray(28 + len(b"os-release"))
+    struct.pack_into("<III", dirent, 0, 1, 1, 8)
+    dirent[16], dirent[17] = len(b"os-release"), 8
+    dirent[28:] = b"os-release"
+    inode = bytearray(56 + len(content))
+    struct.pack_into("<II", inode, 0, 8, 1)
+    struct.pack_into("<III", inode, 32, 0, len(content), len(content))
+    inode[56:] = content
+
+    dump = _dump_with_bootloader(tmp_path)
+    image = bytearray(dump.read_bytes())
+    settings = node(0xE001, bytes(dirent)) + node(0xE002, bytes(inode))
+    image[0xF90000 : 0xF90000 + len(settings)] = settings
+    dump.write_bytes(bytes(image))
+
+    assert main(["inspect", str(dump)]) == 0
+    assert "firmware: 4.5.6_0168" in capsys.readouterr().out

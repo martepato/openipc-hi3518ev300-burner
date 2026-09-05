@@ -108,6 +108,20 @@ class ImageReport:
         return any(f.kind == "gzip" and f.offset < ERASE_BLOCK * 4 for f in self.findings)
 
     @property
+    def is_bootloader_only(self) -> bool:
+        """Nothing in here but a bootloader — a lone U-Boot, not an image.
+
+        A whole-chip dump *begins* with a bootloader, so finding a U-Boot in a
+        file says nothing about what the file is. What separates the two is
+        whether anything else is in there: a standalone `u-boot.bin` is its
+        SPL and one compressed payload near the front and nothing more.
+        """
+        return all(
+            finding.kind == "gzip" and finding.offset < ERASE_BLOCK * 4
+            for finding in self.findings
+        )
+
+    @property
     def is_full_dump(self) -> bool:
         """Whether this looks like a raw dump of an entire flash chip."""
         if self.packaged_update is not None:
