@@ -221,3 +221,33 @@ def test_zero_length_reply_is_not_complete():
     # Long-running commands make the device answer with empty packets until
     # the command finishes; those must not be mistaken for a reply.
     assert not protocol.response_is_complete(b"")
+
+
+def test_carriage_returns_become_separate_lines():
+    # The device separates progress steps with bare CRs so a terminal
+    # overwrites them in place. Kept raw, they also overwrite log prefixes and
+    # each other, which made a real run's debug output unreadable.
+    raw = (
+        b" \rErasing at 0x10000 --  25% complete."
+        b"\rErasing at 0x20000 --  50% complete."
+        b"\rErasing at 0x40000 -- 100% complete."
+        b"\nSF: 262144 bytes @ 0x0 Erased: OK\n[EOT](OK)\r\n\x00"
+    )
+    result = protocol.parse_command_response("sf erase 0x0 0x40000", raw)
+    assert result.ok
+    assert result.output.splitlines() == [
+        "Erasing at 0x10000 --  25% complete.",
+        "Erasing at 0x20000 --  50% complete.",
+        "Erasing at 0x40000 -- 100% complete.",
+        "SF: 262144 bytes @ 0x0 Erased: OK",
+    ]
+    assert "\r" not in result.output
+
+
+def test_output_truncated_by_the_device_buffer_still_parses():
+    # The agent's reply buffer is 200 bytes, so long progress output is cut
+    # mid-word -- visible in HiBurn's own logs as "Written: [EOT](OK)".
+    raw = b" device 0 offset 0x0, size 0x40000\r\nSF: 262144 bytes @ 0x0 Written: [EOT](OK)\r\n\x00"
+    result = protocol.parse_command_response("sf write 0x41000000 0x0 0x40000", raw)
+    assert result.ok
+    assert result.output.endswith("Written:")

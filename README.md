@@ -14,8 +14,13 @@ Zadig, no libusbK, no driver installation of any kind.
 ## Status
 
 **Working.** A Xiaomi MJSXJ02HL (Hi3518EV300) has been flashed end to end with
-this tool from macOS — all five partitions, no drivers installed, no serial
-console, no Windows.
+this tool from macOS — all five partitions, from boot ROM to reboot in one
+command, no drivers installed, no serial console, no Windows.
+
+The U-Boot command stream from that run was diffed against the captured HiBurn
+session: **identical from the first downloaded partition onward**, with the one
+documented difference being that this tool uploads U-Boot for the bootloader
+slot rather than reusing what stage 1 left in RAM.
 
 Both stages were implemented against a **USBPcap capture of a real HiBurn 5.3
 flash** rather than guesswork. The captured frames are checked into

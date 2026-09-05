@@ -183,9 +183,15 @@ def parse_command_response(command: str, raw: bytes) -> CommandResult:
         raise IncompleteResponse(
             f"no [EOT] marker in {len(raw)}-byte reply to {command!r}: {body[:80]!r}"
         )
-    # The device prefixes every reply with a space of its own making.
-    output = body.split(marker, 1)[0].decode("utf-8", errors="replace").strip()
-    return CommandResult(command=command, output=output, ok=ok)
+    # The device prefixes every reply with a space of its own making, and
+    # separates progress steps with bare carriage returns so a terminal
+    # overwrites them in place. Left as-is those CRs also overwrite whatever
+    # else is on the line -- log prefixes included -- so turn each step into
+    # its own line and keep them all.
+    text = body.split(marker, 1)[0].decode("utf-8", errors="replace")
+    lines = [line.strip() for line in text.replace("\r\n", "\n").split("\r")]
+    output = "\n".join(line for line in "\n".join(lines).split("\n") if line.strip())
+    return CommandResult(command=command, output=output.strip(), ok=ok)
 
 
 def response_is_complete(raw: bytes) -> bool:

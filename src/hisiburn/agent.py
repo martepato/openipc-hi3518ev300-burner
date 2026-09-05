@@ -211,7 +211,10 @@ class BurnAgent:
                 break
 
         result = protocol.parse_command_response(command, bytes(buffer))
-        log.debug("result %s: %s", "OK" if result.ok else "ERROR", result.output)
+        # Multi-line progress output would swamp the log; the last line is the
+        # verdict ("Erased: OK") and the rest is a spinner.
+        summary = result.output.splitlines()[-1] if result.output else ""
+        log.debug("result %s: %s", "OK" if result.ok else "ERROR", summary)
         return result
 
     # --- bulk upload -------------------------------------------------------

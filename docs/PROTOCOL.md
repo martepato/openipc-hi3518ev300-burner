@@ -165,7 +165,13 @@ with **zero-length packets** — the capture shows eight of them during one
 working", not as a reply.
 
 Replies are copied into a fixed 200-byte buffer, so long console output is
-truncated mid-line. That is cosmetic, and visible in HiBurn's own logs too.
+truncated mid-line — an `sf write` reply commonly ends at `Written:` with its
+`OK` cut off. That is cosmetic and not a failed write: HiBurn's own logs show
+the identical truncation on the identical commands.
+
+Progress steps within a reply are separated by bare carriage returns, meant to
+overwrite each other on a terminal. A host that logs the text unchanged will
+find them overwriting its own output too, so translate them before printing.
 
 Every reply begins with a space the device prepends.
 
