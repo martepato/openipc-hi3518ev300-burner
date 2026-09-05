@@ -381,3 +381,38 @@ def test_an_almost_empty_boot_slot_is_refused(tmp_path):
     from hisiburn.image import bootloader_from_dump
 
     assert bootloader_from_dump(inspect_image(path), path.read_bytes()) is None
+
+
+# --- naming what is in a differing block ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (b"\xff" * 64, "erased flash"),
+        (b"\x00" * 64, "zeroed"),
+        (b"\x27\x05\x19\x56" + b"\x00" * 60, "uImage header"),
+        (b"hsqs" + b"\x00" * 60, "squashfs superblock"),
+        (struct.pack("<HHI", 0x1985, 0xE002, 64) + b"\x00" * 52, "JFFS2 inode node"),
+        (b"\x00" * 4 + b"nothing here at all" + b"\xf1" * 41, "unrecognised content"),
+    ],
+)
+def test_classify_block(data, expected):
+    from hisiburn.image import classify_block
+
+    assert classify_block(data) == expected
+
+
+def test_a_uboot_environment_is_recognised():
+    # A CRC32 followed by NUL-separated key=value text -- exactly what the
+    # agent U-Boot writes at its env offset when it cannot load one.
+    from hisiburn.image import classify_block
+
+    block = b"\xd0\xbf\x03\xb7" + b"arch=arm\x00baseaddr=0x42000000\x00board=hi3518ev300\x00"
+    assert classify_block(block.ljust(64, b"\x00")) == "U-Boot environment"
+
+
+def test_text_without_an_assignment_is_not_an_environment():
+    from hisiburn.image import classify_block
+
+    assert classify_block(b"\x00" * 4 + b"just some plain text here" * 2) != "U-Boot environment"

@@ -275,7 +275,22 @@ checksum crosses USB. That makes it fast — a whole 16 MiB chip is four round
 trips — and, more usefully, it works on a U-Boot with no device-to-host bulk
 path at all.
 
-A mismatch is narrowed by checking smaller pieces, or one region alone:
+A mismatch is narrowed automatically — the failing range is re-checked per
+erase block, and the block is read back and identified:
+
+```
+2 region(s) differ:
+  0x0040000..0x0050000  U-Boot environment
+  0x0F90000..0x0FA0000  JFFS2 inode node
+```
+
+Those two are the ones that turn up routinely, and neither means the write
+failed: the first is the agent U-Boot's own environment (see below), the
+second is the camera's settings partition. A `uImage header` or
+`squashfs superblock` where the image expects something else would be a real
+problem.
+
+Checking can also be aimed by hand:
 
 ```sh
 hisiburn verify dump.bin --chunk 0x10000              # per 64 KiB erase block

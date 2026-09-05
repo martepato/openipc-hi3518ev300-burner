@@ -463,3 +463,41 @@ def describe_comparison(first: Path, second: Path) -> str:
             f"{region.length // 1024:>5} KiB  {partition_at(region.offset)}"
         )
     return "\n".join(lines)
+
+
+# --- explaining a differing block -------------------------------------------
+
+
+def _looks_like_uboot_env(data: bytes) -> bool:
+    """A U-Boot environment: a CRC32, then NUL-separated key=value text."""
+    body = data[4:]
+    if b"=" not in body:
+        return False
+    printable = sum(1 for b in body if 32 <= b < 127 or b == 0)
+    return printable >= len(body) * 0.9
+
+
+def classify_block(data: bytes) -> str:
+    """Say what a block of flash looks like, to explain why it differs.
+
+    A mismatch is only alarming once you know what replaced what — the two
+    that turn up routinely are the agent U-Boot's own environment and the
+    camera's settings partition, and both are recognisable on sight.
+    """
+    if not data:
+        return "unreadable"
+    if set(data) == {0xFF}:
+        return "erased flash"
+    if set(data) == {0x00}:
+        return "zeroed"
+    if data[:4] == UIMAGE_MAGIC:
+        return "uImage header"
+    if data[:4] == SQUASHFS_MAGIC:
+        return "squashfs superblock"
+    if len(data) >= 12:
+        magic, nodetype, _ = struct.unpack_from("<HHI", data, 0)
+        if magic == 0x1985 and nodetype in JFFS2_NODETYPES:
+            return f"JFFS2 {JFFS2_NODETYPES[nodetype]} node"
+    if _looks_like_uboot_env(data):
+        return "U-Boot environment"
+    return "unrecognised content"

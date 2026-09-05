@@ -16,16 +16,18 @@ import logging
 import re
 import zlib
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from hisiburn.agent import (
+    AgentError,
     BurnAgent,
     erase_command,
     memset_command,
     probe_command,
     write_command,
 )
+from hisiburn.image import classify_block
 from hisiburn.layout import (
     BOOTLOADER_NAMES,
     ERASE_BLOCK,
@@ -426,12 +428,14 @@ class Mismatch:
     length: int
     expected: int
     actual: int
+    #: What the camera actually has there, when it was narrow enough to look.
+    content: str = ""
 
     def __str__(self) -> str:
-        return (
-            f"0x{self.offset:07X}..0x{self.offset + self.length:07X}  "
-            f"expected {self.expected:08x}, camera has {self.actual:08x}"
-        )
+        where = f"0x{self.offset:07X}..0x{self.offset + self.length:07X}"
+        if self.content:
+            return f"{where}  {self.content}"
+        return f"{where}  expected {self.expected:08x}, camera has {self.actual:08x}"
 
 
 def verify_against_image(
@@ -443,6 +447,7 @@ def verify_against_image(
     chunk_size: int = VERIFY_CHUNK,
     skip: int = 0,
     length: int | None = None,
+    narrow_to: int | None = ERASE_BLOCK,
 ) -> list[Mismatch]:
     """Compare flash against ``data`` by checksum, without reading it back.
 
@@ -481,4 +486,28 @@ def verify_against_image(
             on_step(f"{label}: MISMATCH (expected {expected:08x}, got {actual:08x})")
             mismatches.append(Mismatch(flash_offset, len(piece), expected, actual))
 
-    return mismatches
+    if narrow_to is None or chunk_size <= narrow_to:
+        return [_explain(agent, m, staging) for m in mismatches]
+
+    # A 4 MiB mismatch says nothing useful. Re-check just the failing ranges at
+    # erase-block granularity, which is cheap and localises it exactly.
+    narrowed: list[Mismatch] = []
+    for coarse in mismatches:
+        on_step(f"narrowing 0x{coarse.offset:07X} to {narrow_to // 1024} KiB blocks")
+        start = coarse.offset - offset
+        narrowed += verify_against_image(
+            agent, data[start : start + coarse.length], staging, lambda _: None,
+            offset=coarse.offset, chunk_size=narrow_to, narrow_to=None,
+        )
+    return narrowed
+
+
+def _explain(agent: BurnAgent, mismatch: Mismatch, staging: int) -> Mismatch:
+    """Look at what the camera actually has, so the report says something."""
+    try:
+        agent.flash_read(staging, mismatch.offset, 0x1000)
+        head = agent.read_memory(staging, 64)
+    except (AgentError, PlanError) as exc:
+        log.debug("could not read 0x%X to explain it: %s", mismatch.offset, exc)
+        return mismatch
+    return replace(mismatch, content=classify_block(head))

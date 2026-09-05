@@ -280,20 +280,85 @@ def test_verify_reports_a_match(pipe):
     assert any(": ok" in line for line in steps)
 
 
+def _md_reply(payload: bytes, base: int = 0x41000000) -> str:
+    lines = []
+    for i in range(0, len(payload), 16):
+        row = payload[i : i + 16]
+        ascii_col = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        lines.append(f"{base + i:08x}: {row.hex(' ')}    {ascii_col}")
+    return "\r\n".join(lines) + "\r\n"
+
+
 def test_verify_reports_a_mismatch_with_both_checksums(pipe):
     from hisiburn.agent import BurnAgent
     from hisiburn.flash import verify_against_image
 
     data = b"\xa5" * 4096
-    pipe.queue_command_ok()
-    pipe.queue_command_ok()
+    pipe.queue_command_ok()  # sf probe
+    pipe.queue_command_ok()  # sf read
     pipe.queue_command_ok("crc32 for 41000000 ... ==> deadbeef\r\n")
+    pipe.queue_command_ok()  # explain: sf read
+    pipe.queue_command_ok(_md_reply(b"\xff" * 32))
+    pipe.queue_command_ok(_md_reply(b"\xff" * 32, 0x41000020))
 
     mismatches = verify_against_image(BurnAgent(pipe), data, 0x41000000,
                                       lambda _: None, chunk_size=len(data))
     assert len(mismatches) == 1
     assert mismatches[0].actual == 0xDEADBEEF
     assert mismatches[0].offset == 0
+
+
+def test_a_differing_block_is_identified(pipe):
+    """The two mismatches that turn up routinely should name themselves."""
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import verify_against_image
+
+    env = b"\xd0\xbf\x03\xb7" + b"arch=arm\x00baseaddr=0x42000000\x00board=hi\x00"
+    env = env.ljust(64, b"\x00")
+
+    data = b"\xa5" * 4096
+    pipe.queue_command_ok()
+    pipe.queue_command_ok()
+    pipe.queue_command_ok("crc32 for x ... ==> deadbeef\r\n")
+    pipe.queue_command_ok()
+    pipe.queue_command_ok(_md_reply(env[:32]))
+    pipe.queue_command_ok(_md_reply(env[32:], 0x41000020))
+
+    mismatches = verify_against_image(BurnAgent(pipe), data, 0x41000000,
+                                      lambda _: None, chunk_size=len(data))
+    assert mismatches[0].content == "U-Boot environment"
+    assert "U-Boot environment" in str(mismatches[0])
+
+
+def test_a_coarse_mismatch_is_narrowed_to_erase_blocks(pipe):
+    """A 4 MiB mismatch says nothing; the failing block is what matters."""
+    import zlib
+
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import verify_against_image
+
+    block = 0x10000
+    data = b"\x11" * block + b"\x22" * block  # two blocks, one chunk
+    pipe.queue_command_ok()  # sf probe
+    pipe.queue_command_ok()  # sf read, whole chunk
+    pipe.queue_command_ok("crc32 for x ... ==> deadbeef\r\n")  # chunk fails
+    # Narrowing pass: first block matches, second does not.
+    pipe.queue_command_ok()  # sf probe
+    pipe.queue_command_ok()  # sf read block 0
+    pipe.queue_command_ok(f"crc32 ==> {zlib.crc32(data[:block]):08x}\r\n")
+    pipe.queue_command_ok()  # sf read block 1
+    pipe.queue_command_ok("crc32 ==> 12345678\r\n")
+    pipe.queue_command_ok()  # explain: sf read
+    pipe.queue_command_ok(_md_reply(b"\x27\x05\x19\x56" + b"\x00" * 28))
+    pipe.queue_command_ok(_md_reply(b"\x00" * 32, 0x41000020))
+
+    mismatches = verify_against_image(
+        BurnAgent(pipe), data, 0x41000000, lambda _: None,
+        chunk_size=len(data), narrow_to=block,
+    )
+    assert len(mismatches) == 1
+    assert (mismatches[0].offset, mismatches[0].length) == (block, block)
+    assert mismatches[0].content == "uImage header"
 
 
 def test_verify_sends_read_then_crc_per_chunk(pipe):
