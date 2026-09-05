@@ -103,9 +103,15 @@ class AgentError(Exception):
 class CommandFailed(AgentError):
     """A U-Boot command ran and reported failure.
 
-    This is close to fatal for the session: on the ``[EOT](ERROR)`` path the
-    device-side handler returns without re-arming its OUT endpoint, so it stops
-    accepting further commands. Recovering means re-entering download mode.
+    On a stock U-Boot this is close to fatal for the session: the vendor's
+    ``[EOT](ERROR)`` path returns without re-arming the OUT endpoint, so the
+    device stops accepting commands and recovering means re-entering download
+    mode. It also sends the marker alone, so ``result.output`` is empty and
+    there is nothing to say *why* it failed.
+
+    The agent U-Boot built by ``tools/build-agent-uboot.sh`` fixes both: it
+    re-arms either way and sends the console output with the marker, so a
+    failed command there is an ordinary error to handle and carry on from.
     """
 
     def __init__(self, result: protocol.CommandResult):
@@ -379,18 +385,36 @@ class BurnAgent:
     ) -> bytes:
         """Read flash over the agent's bulk upload path.
 
-        Present only in a U-Boot built with `usbtftp`. The device answers each
-        request frame with one bulk transfer, so this moves whole kilobytes per
-        round trip rather than the 32 bytes a hex dump manages.
+        Present only in a U-Boot built by `tools/build-agent-uboot.sh`. The
+        command reads the range into a device-side buffer and arms a callback;
+        the host then pumps request frames, each answered with one bulk
+        transfer. That moves a whole frame per round trip instead of the 32
+        bytes a hex dump manages.
 
-        The command that starts it never replies: `do_usbtftp_upload()` blocks
-        inside its own USB event loop until told to stop, and the reply frames
-        are served from in there. So it is sent without waiting, and released
-        afterwards with `usbtftp end`.
+        The command returns as soon as the buffer is filled -- so it replies
+        like any other, and that reply has to be read before the first request
+        frame or the pipe runs a reply behind for the rest of the transfer.
+        The session it opens is closed by `usbtftp end`, and the device refuses
+        to start another until it is.
+
+        `length` is bounded by U-Boot's heap, not by the protocol: the device
+        malloc()s the whole range up front. `flash.BACKUP_CHUNK_BULK` is sized
+        against the agent build's arena.
         """
-        self.pipe.write(
-            protocol.command_frame(f"usbtftp 0x{offset:x} backup.bin 0x{length:x}")
-        )
+        # A slow SPI read is the whole of this command, so budget it like one.
+        try:
+            self.command(
+                f"usbtftp 0x{offset:x} backup.bin 0x{length:x}",
+                timeout_ms=flash_timeout_ms(length),
+            )
+        except CommandFailed as exc:
+            if "malloc" in exc.result.output:
+                raise AgentError(
+                    f"the device could not allocate {length:,} bytes to serve the "
+                    "read. Its heap is CONFIG_SYS_MALLOC_LEN, so read in smaller "
+                    "pieces (`--chunk`) or raise the arena in the agent build."
+                ) from exc
+            raise
 
         out = bytearray()
         frame_len: int | None = None
@@ -432,11 +456,11 @@ class BurnAgent:
                         "it announced"
                     )
         finally:
-            # Let the device out of its event loop whatever happened, or it
-            # sits there until its own five-second idle timeout.
+            # Always close the session, including after a failure part-way
+            # through: the device frees its buffer here, and refuses to start
+            # another read while one is open.
             try:
-                self.pipe.write(protocol.command_frame("usbtftp end"))
-                self.pipe.read(timeout_ms=2000)
+                self.try_command("usbtftp end", timeout_ms=5_000)
             except (UsbError, AgentError) as exc:
                 log.debug("could not close the usbtftp session: %s", exc)
 

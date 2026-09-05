@@ -176,8 +176,12 @@ find them overwriting its own output too, so translate them before printing.
 Every reply begins with a space the device prepends.
 
 **A failed command ends the session.** On the `[EOT](ERROR)` path the
-device-side handler returns without re-arming its OUT endpoint, so it accepts
-nothing further. Recovering means power-cycling back into download mode.
+device-side handler sends the marker alone and returns *without re-arming its
+OUT endpoint*, so the device accepts nothing further and the console output
+that would have explained the failure is discarded with it. Recovering means
+power-cycling back into download mode. (The agent U-Boot built by
+`tools/build-agent-uboot.sh` gives both verdicts the same path, so a failed
+command there is recoverable and says why it failed.)
 
 ### Uploading an image
 
@@ -300,29 +304,90 @@ Finally, `reset`.
 
 ## Getting data back off the camera
 
-The agent's only device-to-host path is the reply to a command, and that
-reply is copied into a fixed 200-byte buffer. There is no bulk read unless
-U-Boot was built with `usbtftp` — `cmd/Makefile` gates it on `CONFIG_CMD_USB`,
-which OpenIPC's config leaves unset, and its flash-read half is further inside
-`#ifndef CONFIG_MMC`, which that config sets. Two independent reasons it is
-absent from a stock OpenIPC build.
+Writing flash is well served by the protocol. Reading it back is not, and the
+two paths below differ by two orders of magnitude.
 
-What remains is `md.b`, whose hex dump comes back in that reply buffer:
+### Without `usbtftp`: hex dumps
+
+A stock OpenIPC U-Boot has no device-to-host bulk path at all. `cmd/Makefile`
+gates `usbtftp.o` on `CONFIG_CMD_USB`, which that config leaves unset, and the
+command's flash-read half is further inside `#ifndef CONFIG_MMC`, which that
+config sets — two independent reasons it is absent.
+
+What remains is the reply to a command, copied into a fixed 200-byte buffer.
+So: `md.b`, whose hex dump comes back in that buffer.
 
 ```
 41000000: 27 05 19 56 63 fd 39 c1 5e 98 76 aa 00 1d 40 5a    '..Vc.9.^.v...@Z
 ```
 
 At about 79 characters per 16-byte line, two lines is both the most that fits
-and the most that is *safe* to ask for: `udc_puts()` appends to the buffer
-with no bounds check, so a third line would overrun it on the device. That
-caps a read at **32 bytes per round trip**, and a round trip measured about
-**2 ms** in the capture — so roughly 18 minutes for a 16 MiB chip.
+and the most that is *safe* to ask for: `udc_puts()` appends with no bounds
+check, so a third line overruns the buffer on the device. That caps a read at
+**32 bytes per round trip**.
+
+A round trip measured about 2 ms in the Windows capture, which suggested 18
+minutes for a 16 MiB chip. It takes **about two hours** on macOS: the same
+exchange costs roughly 7 ms there, and 500,000 of them is where the time goes.
+Per-round-trip latency, not throughput, is the whole cost of this path — which
+is exactly why the fix is a bigger frame rather than a faster link.
 
 Slow, but checkable: `crc32` runs on the device over the same range, so what
 the host assembled from the text can be compared against what the device
 actually holds, per chunk. That turns an error-prone text channel into one
 that cannot silently corrupt a backup.
+
+### With `usbtftp`: bulk frames
+
+`usbtftp <offset> <name> <length>` reads the range into a device-side buffer
+and arms a callback; the host then drives the transfer one frame per `FB`:
+
+```
+-> AB <len:2> "usbtftp 0xf90000 backup.bin 0x70000"
+<- <output> "[EOT](OK)\r\n\0"          the command returns; it does not block
+
+-> FB
+<- FE <total:4> <frame_length:4>      once, first
+-> FB
+<- DA <up to frame_length bytes>      repeated
+   ...
+-> FB
+<- ED                                 no more data
+
+-> AB <len:2> "usbtftp end"           releases the device-side buffer
+<- <output> "[EOT](OK)\r\n\0"
+```
+
+The `FE` head frame is 9 bytes and carries both the total the device will send
+and the size of each `DA` frame, so a host never has to guess a read size — ask
+for `frame_length + 1` and let a short packet end each frame. The device sends
+`ED` when the total is exhausted, and keeps re-sending `ED` for any further
+`FB`, so reading through to the tail rather than stopping on a byte count is
+both safe and what keeps the pipe synchronised.
+
+Three device-side properties are worth knowing before relying on this:
+
+* **The command `malloc()`s the whole range.** `length` is bounded by
+  `CONFIG_SYS_MALLOC_LEN`, not by the protocol, and the failure mode is a
+  failed command — which on a stock reply path wedges the device. Read in
+  chunks sized against the arena.
+* **Only one session at a time.** A second `usbtftp <off> <file> <len>` before
+  `usbtftp end` is rejected outright, so the release must happen even on an
+  error part-way through a read.
+* **The vendor's frame length is 200 bytes**, which makes this path about 20
+  minutes for a 16 MiB chip — better than hex dumps, still not good. The size
+  is announced in the head frame, so raising it is a device-side change the
+  host needs no knowledge of; the agent build uses 16 KiB and reads a whole
+  chip in about a minute.
+
+As shipped, though, `do_usbtftp_upload()` ends by calling `udc_request()`,
+which reinitialises the USB controller underneath the session that carried the
+command — the host's next transfer fails with `EIO` before any flash comes
+back. The command does not work at all until that call is removed. See
+[AGENT-UBOOT.md](AGENT-UBOOT.md#what-the-script-changes).
+
+Both paths get the same `crc32` check per chunk. A fast transfer is not a
+trusted one.
 
 ## The agent U-Boot writes to flash when it starts
 
@@ -379,14 +444,21 @@ reach the flash has the same effect, HiTool included.
 | `START_MAGIC` semantics | captured stub, decoded against vendor `platform.h` |
 | Flashing command sequence | captured command frames + HiBurn log |
 | Zero-length packets during long commands | observed during `sf erase` |
-| Error path stops the session | vendor source (`usb3_prot.c`), not exercised in the capture |
+| Error path stops the session | vendor source (`usb3_prot.c`), then observed on hardware: a failed command left the device deaf to every frame after it |
 | Boot ROM stalls on a `FA` first frame | observed on hardware (Hi3518EV300, macOS) |
 | Only the agent sends the banner | capture: agent greets after SET_CONFIGURATION, boot ROM does not |
 | An unimplemented opcode un-arms the OUT endpoint | vendor source (no `else` in `usb3_handle_protocol`), and observed: a `getinfo` to the boot ROM left it silent to every later frame |
 | SET_CONFIGURATION re-arms and re-greets | vendor source (`usb3_do_set_config`) |
+| `usbtftp` absent from OpenIPC's build | searched the released binary's decompressed payload — ASCII and UTF-16 — after the config file suggested it; the config alone would not have been evidence |
+| `usbtftp` frame layout (`FE`/`DA`/`ED` on `FB`) | vendor source (`do_upload` in `cmd/usbtftp.c`), then exercised against a rebuilt U-Boot |
+| `udc_request()` breaks the live session | observed on hardware: `EIO` on the first `FB` after `sf probe` succeeded, traced to the re-init in vendor source |
+| 512-byte bulk IN buffer | vendor source (`usb3_drv.c`, `usb3_prot.c`) |
+| Read-back at ~7 ms per round trip on macOS | measured: a full-chip `md.b` backup took about two hours |
 
-The one item resting on source rather than observation is the last: a failed
-command was never provoked in the captured run.
+The last item is worth its own note. The 2 ms round trip in the Windows capture
+was extrapolated here to "about 18 minutes" for a chip that in fact took two
+hours to read on macOS. A number measured on one host's USB stack does not
+transfer to another's, and this document said so too late.
 
 ## For the record: what a source-only reading got wrong
 

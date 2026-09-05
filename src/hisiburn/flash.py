@@ -521,9 +521,11 @@ def _explain(agent: BurnAgent, mismatch: Mismatch, staging: int) -> Mismatch:
 BACKUP_CHUNK = 64 * 1024
 
 #: Chunk for the `usbtftp` path. Bounded by U-Boot's heap, not the protocol:
-#: the read is served from a malloc of exactly this size, against a
-#: CONFIG_SYS_MALLOC_LEN of 384 KiB on this board.
-BACKUP_CHUNK_BULK = 128 * 1024
+#: the device malloc()s exactly this much to serve the read. The agent build
+#: raises CONFIG_SYS_MALLOC_LEN to 8 MiB, so 1 MiB leaves a wide margin, and
+#: a larger chunk would buy nothing -- the round trips that cost time are the
+#: 16 KiB frames inside it, not the command that starts them.
+BACKUP_CHUNK_BULK = 1024 * 1024
 
 
 def run_backup(
@@ -538,17 +540,20 @@ def run_backup(
     resume_from: int = 0,
     bulk: bool = False,
 ) -> int:
-    """Read flash back to a file, through U-Boot's `md.b`.
+    """Read flash back to a file.
 
-    This is the slow path, and unavoidably so: the burn agent has no
-    device-to-host bulk transfer unless U-Boot was built with `usbtftp`, so
-    the bytes come back as hex text in command replies — about 32 per round
-    trip. It is minutes per megabyte rather than seconds.
+    Two paths, chosen by ``bulk``. With ``usbtftp`` the bytes come back over
+    the bulk endpoint in 16 KiB frames, seconds per megabyte. Without it there
+    is no device-to-host transfer at all and they come back as hex text in
+    command replies — about 32 bytes per round trip, minutes per megabyte.
+    Which one is available is a property of the U-Boot that was loaded, so the
+    caller decides; see `tools/build-agent-uboot.sh`.
 
-    What makes it trustworthy rather than merely slow is the checksum: each
-    chunk is checksummed on the device with `crc32` and compared against what
-    was assembled from the text. A dropped line or a misparsed dump cannot
-    pass silently, and a failed chunk is retried before giving up.
+    Both paths are checked the same way, and that is what makes them
+    trustworthy rather than merely fast or slow: each chunk is checksummed on
+    the device with `crc32` and compared against what arrived. A dropped frame
+    or a misparsed dump cannot pass silently, and a failed chunk is retried
+    before giving up.
 
     Each verified chunk is written and flushed immediately, so an interrupted
     run leaves a file that `resume_from` can continue.

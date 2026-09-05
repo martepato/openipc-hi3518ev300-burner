@@ -691,6 +691,13 @@ class Meter:
         )
 
 
+#: Seconds per `md.b` round trip on the fallback path, measured end to end:
+#: a 16 MiB chip took about two hours, which is 524,288 round trips. It is
+#: host-dependent — the same exchange cost about 2 ms in a Windows capture —
+#: so this is the macOS figure the estimate is shown to macOS users with.
+DUMP_ROUND_TRIP_S = 0.0137
+
+
 def cmd_backup(args: argparse.Namespace) -> int:
     destination = Path(args.output)
     resume_from = 0
@@ -733,18 +740,18 @@ def cmd_backup(args: argparse.Namespace) -> int:
         if bulk:
             step(f"{uboot.label} has usbtftp — using the bulk read path")
         else:
-            trips = -(-length // 32)
             why = (
                 "no --uboot was given, so the running U-Boot's capabilities are "
                 "unknown"
                 if capabilities is None
                 else f"{uboot.label} has no usbtftp"
             )
+            minutes = -(-length // 32) * DUMP_ROUND_TRIP_S / 60
             print(
                 f"{why}, so the read falls back to hex dumps:\n32 bytes per round "
-                f"trip, about {trips * 7.0 / 1000 / 60:.0f} minutes for "
-                f"{length:,} bytes. An agent U-Boot reads the\nsame flash in well "
-                "under a minute — see docs/AGENT-UBOOT.md."
+                f"trip, about {minutes:.0f} minutes for {length:,} bytes. An agent "
+                f"U-Boot reads the\nsame flash in well under a minute — see "
+                "docs/AGENT-UBOOT.md."
             )
 
         mode = "r+b" if resume_from else "wb"

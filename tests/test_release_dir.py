@@ -657,7 +657,13 @@ def test_backup_rejects_a_zero_length(pipe, tmp_path):
 
 
 def _queue_usbtftp(pipe, payload: bytes, frame_len: int = 16384):
-    """Frames a U-Boot with usbtftp serves for one read request."""
+    """What a U-Boot with usbtftp sends for one read request.
+
+    The starting command replies like any other -- it fills a buffer and
+    returns rather than blocking in its own event loop -- so its reply comes
+    first and has to be consumed before the frames.
+    """
+    pipe.queue_command_ok()  # the `usbtftp <off> <file> <len>` that starts it
     pipe.queue(b"\xfe" + len(payload).to_bytes(4, "big") + frame_len.to_bytes(4, "big"))
     for i in range(0, len(payload), frame_len):
         pipe.queue(b"\xda" + payload[i : i + frame_len])
@@ -690,6 +696,7 @@ def test_usbtftp_read_takes_the_frame_size_from_the_device(pipe):
 def test_usbtftp_read_rejects_a_short_transfer(pipe):
     from hisiburn.agent import AgentError, BurnAgent
 
+    pipe.queue_command_ok()
     pipe.queue(b"\xfe" + (1024).to_bytes(4, "big") + (256).to_bytes(4, "big"))
     pipe.queue(b"\xda" + b"\x00" * 256)
     pipe.queue(b"\xed")  # ends early, having announced 1024
@@ -701,12 +708,32 @@ def test_usbtftp_read_rejects_a_short_transfer(pipe):
 def test_usbtftp_read_releases_the_device_even_on_failure(pipe):
     from hisiburn.agent import AgentError, BurnAgent
 
+    pipe.queue_command_ok()
     pipe.queue(b"\x99")  # a frame type that means nothing
     pipe.queue_command_ok()
     with pytest.raises(AgentError, match="unexpected frame"):
         BurnAgent(pipe).usbtftp_read(0, 64)
     sent = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
     assert sent[-1] == "usbtftp end"
+
+
+def test_usbtftp_read_consumes_the_starting_command_reply(pipe):
+    """Leaving it unread would put the pipe one reply behind for the whole read."""
+    from hisiburn.agent import BurnAgent
+
+    payload = b"\x11" * 300
+    _queue_usbtftp(pipe, payload, frame_len=128)
+    assert BurnAgent(pipe).usbtftp_read(0, len(payload)) == payload
+    assert not pipe.replies, "a reply left queued means one was never read"
+
+
+def test_usbtftp_read_explains_a_device_heap_it_cannot_fill(pipe):
+    """The device malloc()s the whole range, so a big chunk can simply fail."""
+    from hisiburn.agent import AgentError, BurnAgent
+
+    pipe.queue_command_error("Failed to malloc memory\r\n")
+    with pytest.raises(AgentError, match="could not allocate"):
+        BurnAgent(pipe).usbtftp_read(0, 4 * 1024 * 1024)
 
 
 def test_backup_uses_the_bulk_path_when_asked(pipe, tmp_path):
