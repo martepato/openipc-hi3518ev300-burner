@@ -349,6 +349,42 @@ def inspect_image(path: Path) -> ImageReport:
     return report
 
 
+def bootloader_from_dump(
+    report: ImageReport, data: bytes, minimum: int = 0x6000
+) -> bytes | None:
+    """Pull the bootloader partition out of a whole-chip dump.
+
+    Stage 1 needs a U-Boot to run before anything can be written, and a full
+    dump necessarily carries the one that camera booted — the same mini-boot
+    blob (SPL plus a compressed payload) that a standalone u-boot.bin is. So a
+    dump can supply its own loader instead of the caller hunting for one.
+    """
+    if not report.is_full_dump:
+        return None
+    extents = report.boundaries()
+    if not extents or extents[0][2] != "bootloader" or extents[0][0] != 0:
+        return None
+
+    blob = data[: extents[0][1]]
+    # The slot is padded out with erased flash; trimming it keeps the upload
+    # to what is actually the image, rounded back up so nothing real is lost
+    # to a bootloader that happens to end in 0xFF.
+    trimmed = len(blob.rstrip(b"\xff"))
+    blob = blob[: min(len(blob), round_up_to(trimmed, 4096))]
+
+    # Stage 1 slices the SPL off the front of this, so anything smaller than
+    # that window is not a bootloader — an almost-empty boot slot, most
+    # likely. Refusing here gives a clear message instead of a confusing one
+    # from the loader.
+    if len(blob) < minimum:
+        return None
+    return blob
+
+
+def round_up_to(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
 # --- comparing two images ---------------------------------------------------
 
 

@@ -45,10 +45,18 @@ def factory_dump(tmp_path):
     Offsets and sizes are those binwalk reported for one, so the inference
     here is checked against a layout that exists rather than an invented one.
     """
+    import random
+
+    random.seed(7)
     image = bytearray(b"\xff" * (16 * 1024 * 1024))
     image[0:32] = bytes.fromhex("150500ea" + "feffffea" * 7)
     gzip_header = b"\x1f\x8b\x08\x08" + struct.pack("<I", 1575442370) + b"\x00\x03u-boot.bin\x00"
     image[0x47B0 : 0x47B0 + len(gzip_header)] = gzip_header
+    # A real boot slot is dense: a compressed U-Boot fills most of it.
+    payload_start = 0x47B0 + len(gzip_header)
+    image[payload_start:0x3A000] = bytes(
+        random.getrandbits(8) for _ in range(0x3A000 - payload_start)
+    )
     image[0x40000 : 0x40000 + 64] = _uimage("Linux-4.9.37", 1916698 - 64)
     for offset, inodes, used in (
         (0x230000, 495, 3513074),
@@ -319,3 +327,57 @@ def test_differing_sizes_are_called_out(factory_dump, tmp_path):
     short = tmp_path / "short.bin"
     short.write_bytes(factory_dump.read_bytes()[: 8 * 1024 * 1024])
     assert "sizes differ" in describe_comparison(factory_dump, short)
+
+
+# --- supplying stage 1 from the dump itself ---------------------------------
+
+
+def test_a_dump_can_supply_its_own_bootloader(factory_dump):
+    from hisiburn.image import bootloader_from_dump
+
+    data = factory_dump.read_bytes()
+    blob = bootloader_from_dump(inspect_image(factory_dump), data)
+    assert blob is not None
+    assert blob == data[: len(blob)], "must be the boot slot verbatim"
+    assert len(blob) >= 0x6000, "must cover the SPL window stage 1 slices"
+    assert len(blob) <= 0x40000, "must not run past the boot partition"
+
+
+def test_the_trailing_erased_padding_is_trimmed(factory_dump):
+    from hisiburn.image import bootloader_from_dump
+
+    data = factory_dump.read_bytes()
+    blob = bootloader_from_dump(inspect_image(factory_dump), data)
+    # Shorter than the whole slot, because the tail is erased flash.
+    assert len(blob) < 0x40000
+    # But not trimmed so hard that real bytes were lost.
+    assert len(blob) >= len(data[:0x40000].rstrip(b"\xff"))
+
+
+def test_no_bootloader_from_something_that_is_not_a_dump(tmp_path):
+    from hisiburn.image import bootloader_from_dump
+
+    path = tmp_path / "uImage"
+    path.write_bytes(_uimage("Linux-4.9.37", 1024) + b"\x00" * 1024)
+    data = path.read_bytes()
+    assert bootloader_from_dump(inspect_image(path), data) is None
+
+
+def test_an_almost_empty_boot_slot_is_refused(tmp_path):
+    # Too small to slice an SPL out of: better to say so than to hand stage 1
+    # something that cannot work.
+    import random
+
+    random.seed(3)
+    image = bytearray(b"\xff" * (16 * 1024 * 1024))
+    image[0:32] = bytes.fromhex("150500ea" + "feffffea" * 7)
+    image[0x100 : 0x100 + 14] = b"\x1f\x8b\x08\x08" + b"\x00" * 6 + b"u\x00"
+    image[0x40000 : 0x40000 + 64] = _uimage("Linux-4.9.37", 1024)
+    image[0x230000 : 0x230000 + 96] = _squashfs(10, 1024)
+    image[0x600000 : 0x600000 + 96] = _squashfs(10, 1024)
+    path = tmp_path / "hollow.bin"
+    path.write_bytes(bytes(image))
+
+    from hisiburn.image import bootloader_from_dump
+
+    assert bootloader_from_dump(inspect_image(path), path.read_bytes()) is None

@@ -218,6 +218,11 @@ It refuses anything that does not look like a whole-chip dump, and refuses a
 size that does not match the chip. `--force` overrides both, `--dry-run`
 prints the plan.
 
+Stage 1 still needs a U-Boot to run, and a lone image file has no firmware
+directory to find one in — so a full dump supplies its own, from the
+bootloader at its offset 0. `--uboot PATH` overrides that, and a U-Boot
+sitting next to the image is preferred over the embedded one.
+
 ### Recovering a layout from a HiBurn log
 
 If you have no partition table but have flashed this camera from Windows

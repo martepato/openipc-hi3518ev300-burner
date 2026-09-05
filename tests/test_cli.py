@@ -347,3 +347,97 @@ def test_flash_does_not_boot_when_the_agent_is_already_up(capsys, release_dir, m
     out = capsys.readouterr().out
     assert "Boot ROM is listening" not in out
     assert not any(frame[:1] == b"\xda" for frame in agent_pipe.writes), "no stage 1"
+
+
+# --- restore finding a loader for stage 1 -----------------------------------
+
+
+def _dump_with_bootloader(tmp_path, name="factory.bin"):
+    """A 16 MiB dump whose boot slot holds a usable bootloader."""
+    import random
+    import struct
+
+    random.seed(11)
+    image = bytearray(b"\xff" * (16 * 1024 * 1024))
+    image[0:32] = bytes.fromhex("150500ea" + "feffffea" * 7)
+    header = b"\x1f\x8b\x08\x08" + struct.pack("<I", 0) + b"\x00\x03u-boot.bin\x00"
+    image[0x47B0 : 0x47B0 + len(header)] = header
+    start = 0x47B0 + len(header)
+    image[start:0x3A000] = bytes(random.getrandbits(8) for _ in range(0x3A000 - start))
+
+    uimage = bytearray(64)
+    uimage[0:4] = b"\x27\x05\x19\x56"
+    struct.pack_into(">II", uimage, 12, 1024, 0x40008000)
+    uimage[28], uimage[29], uimage[30] = 5, 2, 2
+    image[0x40000 : 0x40000 + 64] = bytes(uimage)
+
+    for offset in (0x230000, 0x600000, 0x9D0000):
+        block = bytearray(96)
+        block[0:4] = b"hsqs"
+        struct.pack_into("<I", block, 4, 10)
+        struct.pack_into("<I", block, 12, 131072)
+        struct.pack_into("<Q", block, 40, 4096)
+        image[offset : offset + 96] = bytes(block)
+
+    path = tmp_path / name
+    path.write_bytes(bytes(image))
+    return path
+
+
+def test_restore_uses_the_bootloader_inside_the_dump(capsys, tmp_path, monkeypatch):
+    """A lone dump has no firmware directory, but it carries its own loader."""
+    from conftest import FakePipe
+
+    dump = _dump_with_bootloader(tmp_path)
+    bootrom, agent_pipe = FakePipe(), FakePipe()
+    _agent_pipe(monkeypatch, [bootrom, agent_pipe])
+
+    bootrom.queue_timeout(2)  # boot ROM: no banner
+    bootrom.queue_ack(7)  # session open, then a header and tail per image
+    agent_pipe.be_an_agent()
+    agent_pipe.queue_command_ok('Block:64KB Chip:16MB*1 \r\nName:"EN25QH128A"\r\n')
+    agent_pipe.queue_command_ok()  # run_restore's sf probe 0
+    for _ in range(4):  # 16 MiB in 4 MiB chunks
+        agent_pipe.queue_command_ok()  # sf erase
+        agent_pipe.queue_command_ok()  # mw.b
+        agent_pipe.queue_ack(3)  # upload
+        agent_pipe.queue_command_ok()  # sf write
+
+    assert main(["restore", str(dump), "-y", "--no-reset"]) == 0
+    out = capsys.readouterr().out
+    assert "using the bootloader from the image itself" in out
+    assert any(frame[:1] == b"\xda" for frame in bootrom.writes), "stage 1 ran"
+
+
+def test_restore_prefers_a_uboot_beside_the_image(capsys, tmp_path, monkeypatch):
+    from conftest import FakePipe
+
+    dump = _dump_with_bootloader(tmp_path)
+    (tmp_path / "u-boot-hi3518ev300-universal.bin").write_bytes(b"\xa5" * 0x39A43)
+
+    bootrom = FakePipe()
+    _agent_pipe(monkeypatch, [bootrom])
+    bootrom.queue_timeout(2)
+    bootrom.queue(b"\x55")  # refuse stage 1, so the run stops after the choice
+
+    main(["restore", str(dump), "-y", "--no-reset"])
+    out = capsys.readouterr().out
+    assert "u-boot-hi3518ev300-universal.bin" in out
+    assert "from the image itself" not in out
+
+
+def test_restore_explicit_uboot_wins(capsys, tmp_path, monkeypatch):
+    from conftest import FakePipe
+
+    dump = _dump_with_bootloader(tmp_path)
+    (tmp_path / "u-boot-hi3518ev300-universal.bin").write_bytes(b"\xa5" * 0x39A43)
+    chosen = tmp_path / "my-uboot.bin"
+    chosen.write_bytes(b"\x5a" * 0x39A43)
+
+    bootrom = FakePipe()
+    _agent_pipe(monkeypatch, [bootrom])
+    bootrom.queue_timeout(2)
+    bootrom.queue(b"\x55")
+
+    main(["restore", str(dump), "-y", "--no-reset", "--uboot", str(chosen)])
+    assert "my-uboot.bin" in capsys.readouterr().out

@@ -6,6 +6,7 @@ import argparse
 import logging
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from hisiburn import __version__
@@ -155,10 +156,24 @@ def _profile_for(chip: str) -> object:
     return profile
 
 
+@dataclass(frozen=True)
+class UbootImage:
+    """A U-Boot to run on the boot ROM, and where it came from."""
+
+    data: bytes
+    label: str
+
+
+def load_uboot(path: Path) -> UbootImage:
+    if not path.is_file():
+        raise CliError(f"U-Boot image not found: {path}")
+    return UbootImage(path.read_bytes(), path.name)
+
+
 def connect_agent(
     product_id: int | None,
     wait: float,
-    uboot: Path | None = None,
+    uboot: UbootImage | None = None,
     chip: str = DEFAULT_CHIP,
 ) -> tuple[BulkPipe, BurnAgent]:
     """Open the camera and return a pipe onto a running burn agent.
@@ -179,12 +194,15 @@ def connect_agent(
             "the device is attached but no burn agent answered. Both stages share "
             "the same USB id, so this is most likely the boot ROM still waiting "
             "for a download, and no U-Boot image was found to send it. Pass "
-            "--uboot PATH, or run `hisiburn boot -f <u-boot.bin>` first."
+            "--uboot PATH — any U-Boot with HiSilicon's usbtftp support will do, "
+            "such as the u-boot-<soc>-universal.bin from an OpenIPC release."
         )
 
-    data = uboot.read_bytes()
-    print(f"Boot ROM is listening — loading {uboot.name} ({len(data)} bytes) first...")
-    return start_agent(pipe, data, _profile_for(chip), product_id)
+    print(
+        f"Boot ROM is listening — loading {uboot.label} "
+        f"({len(uboot.data)} bytes) first..."
+    )
+    return start_agent(pipe, uboot.data, _profile_for(chip), product_id)
 
 
 # --- commands ---------------------------------------------------------------
@@ -277,7 +295,7 @@ def _describe_pipe(pipe: BulkPipe) -> None:
 
 def cmd_info(args: argparse.Namespace) -> int:
     pipe, agent = connect_agent(
-        args.pid, args.wait, Path(args.uboot) if args.uboot else None, args.chip
+        args.pid, args.wait, load_uboot(Path(args.uboot)) if args.uboot else None, args.chip
     )
     try:
         for topic in ("version", "bootmode", "spi"):
@@ -290,7 +308,7 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     pipe, agent = connect_agent(
-        args.pid, args.wait, Path(args.uboot) if args.uboot else None, args.chip
+        args.pid, args.wait, load_uboot(Path(args.uboot)) if args.uboot else None, args.chip
     )
     try:
         for command in args.command:
@@ -380,9 +398,8 @@ def cmd_flash(args: argparse.Namespace) -> int:
             print("Aborted.")
             return 1
 
-    uboot = Path(args.uboot) if args.uboot else find_uboot(Path(args.dir), layout)
-    if uboot is not None and not uboot.is_file():
-        raise CliError(f"U-Boot image not found: {uboot}")
+    found = Path(args.uboot) if args.uboot else find_uboot(Path(args.dir), layout)
+    uboot = load_uboot(found) if found is not None else None
 
     pipe, agent = connect_agent(args.pid, args.wait, uboot=uboot, chip=args.chip)
     try:
@@ -456,8 +473,9 @@ def cmd_restore(args: argparse.Namespace) -> int:
             print("Aborted.")
             return 1
 
-    uboot = Path(args.uboot) if args.uboot else None
-    pipe, agent = connect_agent(args.pid, args.wait, uboot=uboot, chip=args.chip)
+    pipe, agent = connect_agent(
+        args.pid, args.wait, uboot=_uboot_for_restore(args, report, data), chip=args.chip
+    )
     try:
         print("\nRestoring:")
         info = agent.get_info("spi")
@@ -483,6 +501,39 @@ def cmd_restore(args: argparse.Namespace) -> int:
 
     print("\nDone. The camera should reboot into the restored firmware.")
     return 0
+
+
+def _uboot_for_restore(
+    args: argparse.Namespace, report: object, data: bytes
+) -> UbootImage | None:
+    """Find a U-Boot to start the agent with, for a lone image file.
+
+    Unlike `flash`, restore is pointed at one file rather than a firmware
+    directory, so there may be no loader sitting beside it. A full dump
+    carries one at offset 0, which is the bootloader that camera ran, so it
+    can supply its own.
+    """
+    if args.uboot:
+        return load_uboot(Path(args.uboot))
+
+    beside = find_uboot(Path(args.image).parent)
+    if beside is not None:
+        return load_uboot(beside)
+
+    from hisiburn.image import bootloader_from_dump
+
+    embedded = bootloader_from_dump(report, data, minimum=_profile_for(args.chip).spl_size)
+    if embedded is not None:
+        print(
+            f"No separate U-Boot found; using the bootloader from the image "
+            f"itself ({len(embedded):,} bytes at offset 0)."
+        )
+        print(
+            "  If the camera does not come back as a burn agent, pass --uboot "
+            "with a U-Boot known to have usbtftp support."
+        )
+        return UbootImage(embedded, "bootloader from the image")
+    return None
 
 
 def cmd_from_log(args: argparse.Namespace) -> int:
