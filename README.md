@@ -13,15 +13,18 @@ Zadig, no libusbK, no driver installation of any kind.
 
 ## Status
 
-Both stages are implemented against a **USBPcap capture of a real HiBurn 5.3
-flash**, not guesswork. The captured frames are checked into
-`tests/fixtures/captured_frames.json`, and the test suite asserts that this
-tool reproduces them byte for byte — including a replay test that compares our
-whole U-Boot command stream against HiBurn's, command for command.
+**Working.** A Xiaomi MJSXJ02HL (Hi3518EV300) has been flashed end to end with
+this tool from macOS — all five partitions, no drivers installed, no serial
+console, no Windows.
 
-Not yet exercised on hardware *by this tool*: someone still has to run it end
-to end against a camera. Nothing in stage 1 can brick one — it only writes to
-volatile memory — and stage 2 checks every image size before the first erase.
+Both stages were implemented against a **USBPcap capture of a real HiBurn 5.3
+flash** rather than guesswork. The captured frames are checked into
+`tests/fixtures/captured_frames.json`, and the test suite asserts this tool
+reproduces them byte for byte — including a replay test comparing its whole
+U-Boot command stream against HiBurn's, command for command.
+
+Only this camera has been tested. Other Hi3518EV300 boards should work with
+their own partition table; other SoCs need a profile.
 
 See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full protocol, including
 [what a source-only reading got wrong](docs/PROTOCOL.md#for-the-record-what-a-source-only-reading-got-wrong)
@@ -68,17 +71,74 @@ which one is listening.
 If nothing appears, the camera is not entering download mode — that is a
 button-timing problem, not a driver problem.
 
-### 2. Start a U-Boot in RAM
+### 2. Flash
+
+Point it at a build's output directory. Nothing else is needed:
 
 ```sh
-hisiburn boot -f u-boot.bin
+hisiburn flash -d ./output/release
 ```
 
-This sends the DDR-init stub, the SPL and the U-Boot image. The camera then
-re-enumerates at a new bus address, running the burn agent:
+**It brings the camera up itself.** A camera fresh out of the reset-button
+dance is sitting in its boot ROM, which cannot flash anything — a U-Boot has
+to be loaded into RAM first. The image needed for that is the same bootloader
+the firmware set installs, already in the directory, so `flash` finds it and
+runs that stage for you:
+
+```
+Boot ROM is listening — loading u-boot-hi3518ev300-universal.bin (236099 bytes) first...
+  u-boot [################################] 100.0%  230 KiB
+U-Boot started. Waiting for it to re-enumerate...
+  start download process.
+```
+
+Override the image with `--uboot PATH`. If the camera is already running the
+agent, this step is skipped.
+
+Check what it will do first — this touches nothing:
 
 ```sh
-hisiburn info
+hisiburn flash -d ./output/release --dry-run
+```
+
+```
+Layout: usb-burn.xml in ./output/release
+Plan for usb-burn (5 partitions):
+  fastboot: u-boot-hi3518ev300-universal.bin (236099 bytes) -> 0x0, writing 0x40000
+  env: env.bin (65536 bytes) -> 0x40000, writing 0x10000
+  kernel: uImage.hi3518ev300 (1908952 bytes) -> 0x50000, writing 0x1e0000
+  rootfs: rootfs.squashfs.hi3518ev300 (5693440 bytes) -> 0x350000, writing 0x570000
+  rootfs_data: erase 0x2b0000 at 0xd50000
+  total to transfer: 7.54 MiB
+  4 image(s) match sha256sums.txt
+```
+
+**It reads the build's own partition table.** If the directory holds a HiTool
+`usb-burn.xml`, that is the layout — it was written by whoever built the
+firmware and names its actual files, which beats any built-in guess. A
+built-in layout is used only when there is no table to read. Override with
+`--layout-file` (a `.xml` or JSON) or `--layout NAME`.
+
+**It verifies checksums first.** If the build shipped `sha256sums.txt` or
+`md5sums.txt`, the images are checked against it before a single block is
+erased — a truncated download is the cheapest way to brick a camera.
+`--no-verify` skips it.
+
+Useful flags: `--only kernel rootfs` to flash a subset (`boot` and `fastboot`
+name the same partition), `--image NAME=PATH` to point a partition at a
+specific file, `--no-reset` to leave the camera halted.
+
+Expect about a minute: erase runs at roughly 2.7 s/MiB and write at 1.6 s/MiB
+on these NOR parts, so the long silences during `sf erase` are normal.
+
+### Driving the stages by hand
+
+`flash` covers the normal path. The stages are separately available when you
+want them — to inspect a camera without writing anything, say:
+
+```sh
+hisiburn boot -f u-boot-hi3518ev300-universal.bin   # stage 1 only
+hisiburn info                                        # ask a running agent
 ```
 
 ```
@@ -87,31 +147,8 @@ bootmode   spi
 spi        Block:64KB Chip:16MB*1 ID:0x1C 0x70 0x18 Name:"EN25QH128A"
 ```
 
-### 3. Flash
-
-```sh
-hisiburn flash -d ./openipc-firmware --layout mjsxj02hl-16m
-```
-
-Check what it will do first — this touches nothing:
-
-```sh
-hisiburn flash -d ./openipc-firmware --dry-run
-```
-
-```
-Plan for mjsxj02hl-16m (5 partitions):
-  boot: u-boot.bin (196608 bytes) -> 0x0, writing 0x30000
-  env: env.bin (65536 bytes) -> 0x40000, writing 0x10000
-  kernel: uImage.hi3518ev300 (1908952 bytes) -> 0x50000, writing 0x1e0000
-  rootfs: rootfs.squashfs.hi3518ev300 (5689344 bytes) -> 0x350000, writing 0x570000
-  rootfs_data: erase 0x2B0000 at 0xD50000
-  total to transfer: 7.50 MiB
-```
-
-Useful flags: `--only kernel rootfs` to flash a subset, `--image NAME=PATH` to
-point a partition at a differently-named file, `--no-reset` to leave the
-camera halted afterwards.
+`info` and `run` will also start the agent themselves if you give them
+`--uboot PATH`.
 
 ### Recovering a layout from a HiBurn log
 
@@ -135,6 +172,8 @@ console even without a UART:
 ```sh
 hisiburn run 'sf probe 0' 'sf read 0x41000000 0x0 0x10000' 'md 0x41000000 0x20'
 ```
+
+Nothing here needs a serial console.
 
 ## Safety
 

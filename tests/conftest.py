@@ -89,3 +89,28 @@ def fixture_log(request) -> object:
     from pathlib import Path
 
     return Path(request.path).parent / "fixtures" / "hiburn_session.log"
+
+
+@pytest.fixture
+def release_dir(tmp_path):
+    """A firmware directory shaped like a real build's output/release/."""
+    import hashlib
+    from pathlib import Path
+
+    fixtures = Path(__file__).parent / "fixtures" / "release"
+    images = {
+        "u-boot-hi3518ev300-universal.bin": 236099,
+        "env.bin": 65536,
+        "uImage.hi3518ev300": 1908952,
+        "rootfs.squashfs.hi3518ev300": 5693440,
+    }
+    for name, size in images.items():
+        (tmp_path / name).write_bytes(name.encode()[:1] * size)
+    (tmp_path / "usb-burn.xml").write_bytes((fixtures / "usb-burn.xml").read_bytes())
+    (tmp_path / "sha256sums.txt").write_text(
+        "".join(
+            f"{hashlib.sha256((tmp_path / n).read_bytes()).hexdigest()}  {n}\n"
+            for n in images
+        )
+    )
+    return tmp_path

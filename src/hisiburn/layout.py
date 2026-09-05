@@ -12,6 +12,10 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
+#: Names used for the bootloader slot. U-Boot's own mtdparts calls it "boot",
+#: HiTool partition tables call it "fastboot".
+BOOTLOADER_NAMES = frozenset({"boot", "fastboot", "uboot", "u-boot"})
+
 #: NOR erase granularity on these cameras. Writes are padded up to it because
 #: `sf write` cannot leave a partial block half-programmed.
 ERASE_BLOCK = 64 * 1024

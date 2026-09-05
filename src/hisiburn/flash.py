@@ -25,7 +25,7 @@ from hisiburn.agent import (
     probe_command,
     write_command,
 )
-from hisiburn.layout import FlashLayout, LayoutError, Partition, round_up
+from hisiburn.layout import BOOTLOADER_NAMES, FlashLayout, LayoutError, Partition, round_up
 
 log = logging.getLogger(__name__)
 
@@ -299,3 +299,38 @@ def verify_checksums(plan: FlashPlan, directory: Path, on_step: StepCallback) ->
         on_step(f"{checked} image(s) match {path.name}")
     else:
         on_step(f"{path.name} lists none of these images; skipping verification")
+
+
+# --- locating the U-Boot to run before flashing -----------------------------
+
+#: Filenames a U-Boot image plausibly has, when a layout does not name one.
+UBOOT_GLOBS = ("u-boot*.bin", "uboot*.bin", "fastboot*.bin")
+
+
+def find_uboot(directory: Path, layout: FlashLayout | None = None) -> Path | None:
+    """Find the U-Boot image in a firmware directory.
+
+    Stage 1 needs a U-Boot to run before anything can be flashed, and a
+    firmware set almost always ships the one it is about to install. Preferring
+    the layout's own bootloader entry means using the name the build declared
+    rather than guessing.
+    """
+    directory = Path(directory)
+
+    if layout is not None:
+        for partition in layout.partitions:
+            if partition.name in BOOTLOADER_NAMES or partition.offset == 0:
+                for candidate in partition.candidates:
+                    path = directory / candidate
+                    if path.is_file():
+                        return path
+
+    for pattern in UBOOT_GLOBS:
+        matches = sorted(path for path in directory.glob(pattern) if path.is_file())
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            # Several candidates and no layout to disambiguate: picking one at
+            # random is worse than saying so.
+            return None
+    return None

@@ -251,3 +251,92 @@ def test_probe_reports_a_device_that_answers_nothing(capsys, pipe, monkeypatch):
     out = capsys.readouterr().out
     assert "session open (FE): no reply" in out
     assert "Power-cycle" in out
+
+
+# --- bringing the agent up automatically ------------------------------------
+
+
+def _agent_pipe(monkeypatch, stages):
+    """Serve a sequence of fake pipes from BulkPipe/find_device.
+
+    Each entry is a FakePipe; they are handed out in order as the code opens
+    the device, re-enumerates, and opens it again.
+    """
+    from hisiburn.usbdev import FoundDevice
+
+    handed = iter(stages)
+    device = FoundDevice(0x12D1, 0xD001, 2, 6, "Hislicon", "HiUSBBurn")
+    monkeypatch.setattr("hisiburn.cli.find_device", lambda *a, **k: object())
+    monkeypatch.setattr("hisiburn.cli.wait_for_device", lambda *a, **k: object())
+    monkeypatch.setattr("hisiburn.cli.BulkPipe", lambda dev: next(handed))
+    for pipe in stages:
+        pipe.info = device
+    return stages
+
+
+def _queue_erase_only_flash(pipe):
+    """Replies for `--only rootfs_data`: chip check, then probe and erase."""
+    pipe.queue_command_ok()  # verify_flash_chip: sf probe 0
+    pipe.queue_command_ok('Block:64KB Chip:16MB*1 \r\nName:"EN25QH128A"\r\n')
+    pipe.queue_command_ok()  # run_plan: sf probe 0
+    pipe.queue_command_ok()  # run_plan: sf erase
+    # `reset` gets no reply, which is what a rebooting camera does.
+
+
+def test_flash_starts_the_agent_itself_when_it_finds_the_boot_rom(
+    capsys, release_dir, monkeypatch
+):
+    """The image stage 1 needs is the one being flashed; don't make users do it."""
+    from conftest import FakePipe
+
+    bootrom, agent_pipe = FakePipe(), FakePipe()
+    _agent_pipe(monkeypatch, [bootrom, agent_pipe])
+
+    # Boot ROM: silent to the greeting, then answers nothing to getinfo.
+    bootrom.queue_timeout(2)
+    # Stage 1: an ACK for the session open, then a header and tail per image.
+    bootrom.queue_ack(7)
+    # The agent that comes up afterwards.
+    agent_pipe.queue(b"start download process.\x00")
+    agent_pipe.queue_command_ok("version: U-Boot 2016.11-g131d3f2\r\n")
+    _queue_erase_only_flash(agent_pipe)
+
+    code = main(["flash", "-d", str(release_dir), "-y", "--only", "rootfs_data"])
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "Boot ROM is listening" in out
+    assert "u-boot-hi3518ev300-universal.bin" in out
+    assert "start download process." in out
+    # Stage 1 really ran: three images went across as DATA frames.
+    assert any(frame[:1] == b"\xda" for frame in bootrom.writes)
+
+
+def test_flash_says_what_to_do_when_no_uboot_can_be_found(
+    capsys, release_dir, monkeypatch
+):
+    from conftest import FakePipe
+
+    bootrom = FakePipe()
+    _agent_pipe(monkeypatch, [bootrom])
+    bootrom.queue_timeout(2)
+    (release_dir / "u-boot-hi3518ev300-universal.bin").unlink()
+
+    assert main([
+        "flash", "-d", str(release_dir), "-y", "--only", "rootfs_data", "--no-verify",
+    ]) == 1
+    assert "--uboot PATH" in capsys.readouterr().err
+
+
+def test_flash_does_not_boot_when_the_agent_is_already_up(capsys, release_dir, monkeypatch):
+    from conftest import FakePipe
+
+    agent_pipe = FakePipe()
+    _agent_pipe(monkeypatch, [agent_pipe])
+    agent_pipe.queue_timeout()  # no greeting; it was consumed earlier
+    agent_pipe.queue_command_ok("version: U-Boot 2016.11-g131d3f2\r\n")
+    _queue_erase_only_flash(agent_pipe)
+
+    assert main(["flash", "-d", str(release_dir), "-y", "--only", "rootfs_data"]) == 0
+    out = capsys.readouterr().out
+    assert "Boot ROM is listening" not in out
+    assert not any(frame[:1] == b"\xda" for frame in agent_pipe.writes), "no stage 1"

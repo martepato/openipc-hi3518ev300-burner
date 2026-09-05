@@ -139,3 +139,43 @@ def test_missing_image_names_what_the_directory_holds(capsys, release):
     err = capsys.readouterr().err
     assert "env.bin" in err
     assert "uImage.hi3518ev300" in err, "should list what is actually there"
+
+
+# --- finding the U-Boot to run before flashing ------------------------------
+
+
+def test_uboot_is_found_from_the_layouts_bootloader_entry(release):
+    from hisiburn.flash import find_uboot
+
+    layout = layout_from_xml(release / "usb-burn.xml")
+    assert find_uboot(release, layout).name == "u-boot-hi3518ev300-universal.bin"
+
+
+def test_uboot_is_found_without_a_layout(release):
+    from hisiburn.flash import find_uboot
+
+    assert find_uboot(release).name == "u-boot-hi3518ev300-universal.bin"
+
+
+def test_uboot_is_found_for_a_rootfs_only_layout(release):
+    # The rootfs-only table names no bootloader, but the image is still there
+    # and stage 1 still needs one.
+    from hisiburn.flash import find_uboot
+
+    layout = layout_from_xml(release / "usb-burn-rootfs-only.xml")
+    assert find_uboot(release, layout).name == "u-boot-hi3518ev300-universal.bin"
+
+
+def test_no_uboot_in_the_directory(tmp_path):
+    from hisiburn.flash import find_uboot
+
+    assert find_uboot(tmp_path) is None
+
+
+def test_ambiguous_uboot_candidates_are_not_guessed_between(release):
+    # Two plausible images and no layout entry to choose by: better to say
+    # nothing than to flash the wrong bootloader.
+    from hisiburn.flash import find_uboot
+
+    (release / "u-boot-old.bin").write_bytes(b"\x00" * 1024)
+    assert find_uboot(release) is None

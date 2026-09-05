@@ -14,6 +14,7 @@ from hisiburn.bootrom import PROFILES, BootRom, BootRomError
 from hisiburn.flash import (
     PlanError,
     build_plan,
+    find_uboot,
     run_plan,
     verify_checksums,
     verify_flash_chip,
@@ -36,6 +37,10 @@ log = logging.getLogger("hisiburn")
 #: Used only when nothing better is available: no --layout given, and no
 #: partition table alongside the images.
 DEFAULT_LAYOUT = "mjsxj02hl-16m"
+
+#: Only one SoC family is supported so far; the flag exists for when that
+#: changes, not because anyone needs to pass it today.
+DEFAULT_CHIP = "hi3518ev300"
 
 #: Every device command waits by default. Getting a camera into download mode
 #: means unplugging it, holding reset and plugging back in, which no one can do
@@ -96,19 +101,89 @@ def open_pipe(product_id: int | None, wait: float) -> BulkPipe:
     return BulkPipe(device)
 
 
-def connect_agent(product_id: int | None, wait: float) -> tuple[BulkPipe, BurnAgent]:
-    """Open the camera and confirm a burn agent — not the boot ROM — is on it."""
+def start_agent(
+    pipe: BulkPipe,
+    uboot: bytes,
+    profile: object,
+    product_id: int | None,
+) -> tuple[BulkPipe, BurnAgent]:
+    """Run stage 1 on ``pipe``, then return a pipe onto the agent it starts.
+
+    The camera re-enumerates when U-Boot takes over, so the pipe handed back is
+    a new one — the caller's original is closed here.
+    """
+    previous = pipe.info.location
+    try:
+        BootRom(pipe).boot_uboot(uboot, profile, on_progress=ProgressBar("u-boot"))
+    finally:
+        pipe.close()
+
+    # The loaded U-Boot comes back under the same USB id, so the handoff shows
+    # up as a re-enumeration at a new address rather than a new product id.
+    print("U-Boot started. Waiting for it to re-enumerate...")
+    try:
+        device = wait_for_device(product_id, timeout=20.0, exclude=previous)
+    except DeviceNotFound:
+        # A host can hand the device back its old address, which the exclusion
+        # above would then skip forever. Fall back to whatever is attached.
+        log.debug("no device at a new address; retrying without the exclusion")
+        try:
+            device = wait_for_device(product_id, timeout=5.0)
+        except DeviceNotFound as exc:
+            raise CliError(
+                f"{exc}\nThe images went across but nothing came back. Check that "
+                "this U-Boot was built with HiSilicon's usbtftp support."
+            ) from exc
+
+    new_pipe = BulkPipe(device)
+    agent = BurnAgent(new_pipe)
+    greeting = agent.read_greeting()
+    if greeting:
+        print(f"  {greeting}")
+    if not agent.is_agent():
+        new_pipe.close()
+        raise CliError("the device re-enumerated but is not answering as a burn agent")
+    return new_pipe, agent
+
+
+def _profile_for(chip: str) -> object:
+    profile = PROFILES.get(chip)
+    if profile is None:
+        raise CliError(f"unknown chip {chip!r} (known: {', '.join(sorted(PROFILES))})")
+    return profile
+
+
+def connect_agent(
+    product_id: int | None,
+    wait: float,
+    uboot: Path | None = None,
+    chip: str = DEFAULT_CHIP,
+) -> tuple[BulkPipe, BurnAgent]:
+    """Open the camera and return a pipe onto a running burn agent.
+
+    A camera fresh out of the reset-button dance is in its boot ROM, which
+    cannot flash anything. Given a U-Boot image, stage 1 is run here rather
+    than making the caller do it by hand — the image a firmware set installs
+    is the same one the boot ROM needs, so there is nothing extra to supply.
+    """
     pipe = open_pipe(product_id, wait)
     agent = BurnAgent(pipe)
     agent.read_greeting()
-    if not agent.is_agent():
+    if agent.is_agent():
+        return pipe, agent
+
+    if uboot is None:
         pipe.close()
         raise CliError(
             "the device is attached but no burn agent answered. Both stages share "
             "the same USB id, so this is most likely the boot ROM still waiting "
-            "for a download — run `hisiburn boot -f u-boot.bin` first."
+            "for a download, and no U-Boot image was found to send it. Pass "
+            "--uboot PATH, or run `hisiburn boot -f <u-boot.bin>` first."
         )
-    return pipe, agent
+
+    data = uboot.read_bytes()
+    print(f"Boot ROM is listening — loading {uboot.name} ({len(data)} bytes) first...")
+    return start_agent(pipe, data, _profile_for(chip), product_id)
 
 
 # --- commands ---------------------------------------------------------------
@@ -204,7 +279,9 @@ def _describe_pipe(pipe: BulkPipe) -> None:
 
 
 def cmd_info(args: argparse.Namespace) -> int:
-    pipe, agent = connect_agent(args.pid, args.wait)
+    pipe, agent = connect_agent(
+        args.pid, args.wait, Path(args.uboot) if args.uboot else None, args.chip
+    )
     try:
         for topic in ("version", "bootmode", "spi"):
             value = " ".join(agent.get_info(topic).split())
@@ -215,7 +292,9 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    pipe, agent = connect_agent(args.pid, args.wait)
+    pipe, agent = connect_agent(
+        args.pid, args.wait, Path(args.uboot) if args.uboot else None, args.chip
+    )
     try:
         for command in args.command:
             result = agent.try_command(command, timeout_ms=args.timeout * 1000)
@@ -234,47 +313,15 @@ def cmd_boot(args: argparse.Namespace) -> int:
     uboot = Path(args.file)
     if not uboot.is_file():
         raise CliError(f"U-Boot image not found: {uboot}")
-    profile = PROFILES.get(args.chip)
-    if profile is None:
-        raise CliError(f"unknown chip {args.chip!r} (known: {', '.join(sorted(PROFILES))})")
+    profile = _profile_for(args.chip)
 
     data = uboot.read_bytes()
     print(f"Loading {uboot.name} ({len(data)} bytes) via the boot ROM...")
 
     pipe = open_pipe(args.pid, args.wait)
-    previous = pipe.info.location
-    try:
-        BootRom(pipe).boot_uboot(data, profile, on_progress=ProgressBar("upload"))
-    finally:
-        pipe.close()
-
-    # The loaded U-Boot comes back under the same USB id, so the handoff shows
-    # up as a re-enumeration at a new address rather than a new product id.
-    print("U-Boot started. Waiting for it to re-enumerate...")
-    try:
-        device = wait_for_device(args.pid, timeout=20.0, exclude=previous)
-    except DeviceNotFound:
-        # A host can hand the device back its old address, which the exclusion
-        # above would then skip forever. Fall back to whatever is attached.
-        log.debug("no device at a new address; retrying without the exclusion")
-        try:
-            device = wait_for_device(args.pid, timeout=5.0)
-        except DeviceNotFound as exc:
-            raise CliError(
-                f"{exc}\nThe images went across but nothing came back. Check that "
-                "this U-Boot was built with HiSilicon's usbtftp support."
-            ) from exc
-
-    with BulkPipe(device) as pipe:
-        agent = BurnAgent(pipe)
-        greeting = agent.read_greeting()
-        if greeting:
-            print(f"  {greeting}")
-        if agent.is_agent():
-            print(f"Agent ready: {agent.get_info('version')}")
-        else:
-            print("Device re-enumerated but is not answering as a burn agent.")
-            return 1
+    agent_pipe, agent = start_agent(pipe, data, profile, args.pid)
+    with agent_pipe:
+        print(f"Agent ready: {agent.get_info('version')}")
     return 0
 
 
@@ -336,7 +383,11 @@ def cmd_flash(args: argparse.Namespace) -> int:
             print("Aborted.")
             return 1
 
-    pipe, agent = connect_agent(args.pid, args.wait)
+    uboot = Path(args.uboot) if args.uboot else find_uboot(Path(args.dir), layout)
+    if uboot is not None and not uboot.is_file():
+        raise CliError(f"U-Boot image not found: {uboot}")
+
+    pipe, agent = connect_agent(args.pid, args.wait, uboot=uboot, chip=args.chip)
     try:
         print("\nFlashing:")
         verify_flash_chip(agent, layout, step)
@@ -399,7 +450,9 @@ def cmd_layouts(args: argparse.Namespace) -> int:
 SHARED_DEFAULTS = {"verbose": False, "pid": None, "wait": DEFAULT_WAIT}
 
 
-def _shared_options() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
+def _shared_options() -> tuple[
+    argparse.ArgumentParser, argparse.ArgumentParser, argparse.ArgumentParser
+]:
     """Options accepted on either side of the subcommand.
 
     Each is attached to the top-level parser *and* to every subcommand that
@@ -423,11 +476,23 @@ def _shared_options() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]
         help=f"seconds to wait for the camera to appear (default {DEFAULT_WAIT:.0f}; "
              "0 fails immediately)",
     )
-    return general, device
+    # Commands that can start the burn agent themselves when they find the
+    # boot ROM instead.
+    booting = argparse.ArgumentParser(add_help=False)
+    booting.add_argument(
+        "--uboot", metavar="PATH",
+        help="U-Boot to load if the camera is still in its boot ROM "
+             "(default: the bootloader image in the firmware directory)",
+    )
+    booting.add_argument(
+        "-c", "--chip", default=DEFAULT_CHIP,
+        help=f"chip profile for the boot ROM stage (default {DEFAULT_CHIP})",
+    )
+    return general, device, booting
 
 
 def build_parser() -> argparse.ArgumentParser:
-    general, device = _shared_options()
+    general, device, booting = _shared_options()
 
     parser = argparse.ArgumentParser(
         prog="hisiburn",
@@ -447,12 +512,12 @@ def build_parser() -> argparse.ArgumentParser:
     probe.set_defaults(func=cmd_probe)
 
     info = sub.add_parser(
-        "info", parents=[general, device], help="query a running burn agent"
+        "info", parents=[general, device, booting], help="query a running burn agent"
     )
     info.set_defaults(func=cmd_info)
 
     run = sub.add_parser(
-        "run", parents=[general, device],
+        "run", parents=[general, device, booting],
         help="run U-Boot console commands through the agent",
     )
     run.add_argument("command", nargs="+", help="commands to run in order")
@@ -460,14 +525,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.set_defaults(func=cmd_run)
 
     boot = sub.add_parser(
-        "boot", parents=[general, device], help="load and start U-Boot via the boot ROM"
+        "boot", parents=[general, device],
+        help="load and start U-Boot via the boot ROM (flash does this for you)",
     )
     boot.add_argument("-f", "--file", required=True, help="U-Boot binary")
-    boot.add_argument("-c", "--chip", default="hi3518ev300", help="chip profile")
+    boot.add_argument("-c", "--chip", default=DEFAULT_CHIP, help="chip profile")
     boot.set_defaults(func=cmd_boot)
 
     flash = sub.add_parser(
-        "flash", parents=[general, device],
+        "flash", parents=[general, device, booting],
         help="write a firmware set to the camera's flash",
     )
     flash.add_argument("-d", "--dir", default=".", help="directory holding the images")
