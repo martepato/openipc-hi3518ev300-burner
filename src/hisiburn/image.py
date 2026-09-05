@@ -37,10 +37,10 @@ UIMAGE_COMPRESSION = {0: "uncompressed", 1: "gzip", 2: "bzip2", 3: "lzma", 4: "l
 SQUASHFS_MAGIC = b"hsqs"
 JFFS2_MAGIC = b"\x85\x19"
 
-#: JFFS2 node types. Requiring one of these alongside the magic turns a
-#: 16-bit signature into a 32-bit one, which is the difference between
-#: matching real nodes and matching noise: a bare 0x1985 lands roughly once
-#: per 64 KiB of random data, so on a 16 MiB image it appears everywhere.
+#: JFFS2 node types. Requiring one of these alongside the magic, and the
+#: header CRC alongside both, is the difference between matching real nodes
+#: and matching noise: a bare 0x1985 lands roughly once per 64 KiB of random
+#: data, so on a 16 MiB image it appears everywhere.
 JFFS2_NODETYPES = {
     0xE001: "dirent", 0xE002: "inode", 0x2003: "cleanmarker",
     0x2004: "padding", 0x2006: "summary", 0xE008: "xattr", 0xE009: "xref",
@@ -48,6 +48,11 @@ JFFS2_NODETYPES = {
 
 #: A node bigger than this is not a node; JFFS2 keeps them small.
 JFFS2_MAX_NODE = 1 << 20
+
+#: Ceiling on a file reassembled out of JFFS2 nodes. The settings files a
+#: version is read from are tens of bytes; anything past this is a real file
+#: and not worth rebuilding in memory to grep.
+MAX_SETTINGS_FILE = 64 * 1024
 GZIP_MAGIC = b"\x1f\x8b\x08"
 UBI_MAGIC = b"UBI#"
 
@@ -80,6 +85,9 @@ class ImageReport:
     size: int
     findings: list[Finding] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: What firmware the camera this came from was running, when the image
+    #: carries a settings partition that says so.
+    firmware: FirmwareVersion | None = None
 
     @property
     def is_chip_sized(self) -> bool:
@@ -177,9 +185,10 @@ class ImageReport:
             f"{self.path.name}: {self.size:,} bytes "
             f"({self.size / 1024 / 1024:.2f} MiB)",
             f"verdict: {self.verdict}",
-            "",
-            "contents:",
         ]
+        if self.firmware is not None:
+            lines.append(f"firmware: {self.firmware}")
+        lines += ["", "contents:"]
         lines += [f"  {finding}" for finding in self.findings] or ["  (nothing recognised)"]
         if self.is_full_dump:
             lines += ["", "inferred partition extents:"]
@@ -256,8 +265,25 @@ def _gzip(data: bytes, offset: int) -> Finding:
     )
 
 
+def jffs2_header_crc(header: bytes) -> int:
+    """JFFS2's CRC over the 8 bytes before the field that holds it.
+
+    Not zlib's convention: JFFS2 seeds with ~0 and does not invert the result,
+    which is the same polynomial run with the two conventions swapped. Checked
+    against 34 of 34 nodes in a real settings partition.
+    """
+    return (zlib.crc32(header[:8], 0xFFFFFFFF) ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+
 def _jffs2_node(data: bytes, offset: int) -> tuple[int, int] | None:
-    """Validate a JFFS2 node header, returning (nodetype, total length)."""
+    """Validate a JFFS2 node header, returning (nodetype, total length).
+
+    Magic, node type and header CRC together make this a 64-bit signature, so
+    a match is a node rather than a coincidence. That matters twice over here:
+    once because a bare 0x1985 lands about once per 64 KiB of random data, and
+    again because a bogus dirent that passed would name a bogus inode and the
+    version read out of it would be a plausible-looking lie.
+    """
     if offset % 4 or offset + 12 > len(data):
         return None
     magic, nodetype, totlen = struct.unpack_from("<HHI", data, offset)
@@ -265,7 +291,178 @@ def _jffs2_node(data: bytes, offset: int) -> tuple[int, int] | None:
         return None
     if not (12 <= totlen <= JFFS2_MAX_NODE) or offset + totlen > len(data):
         return None
+    stored_crc = struct.unpack_from("<I", data, offset + 8)[0]
+    if jffs2_header_crc(data[offset : offset + 8]) != stored_crc:
+        return None
     return nodetype, totlen
+
+
+#: JFFS2 data-node compression methods this can undo. The settings files a
+#: version is read from are tens of bytes, so they are stored uncompressed;
+#: zlib is handled anyway because it costs a line.
+JFFS2_COMPR_NONE = 0
+JFFS2_COMPR_ZLIB = 6
+
+#: Small text files in the settings partition that name the firmware version,
+#: and the key each states it under. Both are written by the camera's own
+#: updater, and on every dump seen so far they agree — so the first that
+#: parses is used and the other is not consulted.
+VERSION_FILES = {
+    b"os-release": ("ISA_VERSION", "VERSION_ID", "VERSION"),
+    b"app.ver": ("appver",),
+}
+
+#: Where the model comes from, and the two keys read out of it. Deliberately
+#: only those two, and deliberately `.product_config` before `device.conf`:
+#: both files also hold the camera's cloud credentials -- an auth key, a P2P
+#: id, a MAC -- and a tool that summarises a dump should not be the reason
+#: those land in a terminal, a scrollback, or a pasted bug report.
+DEVICE_FILES = {
+    b".product_config": ("PRODUCT_MODEL", "PRODUCT_TYPE"),
+    b"device.conf": ("model", "vendor"),
+}
+
+
+@dataclass(frozen=True)
+class FirmwareVersion:
+    """The firmware version a dump was taken from, and where it was found."""
+
+    version: str
+    #: The file it was read out of, e.g. "os-release".
+    source: str
+    #: Byte offset of the data node that held it.
+    offset: int
+    model: str | None = None
+    vendor: str | None = None
+
+    def __str__(self) -> str:
+        what = self.version
+        if self.model:
+            what += f" on {self.model}"
+        return f"{what} (from {self.source} at 0x{self.offset:08X})"
+
+
+def _jffs2_files(data: bytes) -> dict[bytes, tuple[bytes, int]]:
+    """Reassemble the small files in a JFFS2 area: name -> (content, offset).
+
+    JFFS2 is log-structured: a write appends a new node rather than replacing
+    the old one, so a dump holds every version a file ever had. Which is why
+    grepping a dump for a version string finds several and cannot tell you
+    which one the camera was running -- both dumps behind this function carry
+    `4.0.4_0073` and two dozen copies of `4.0.5_0105` regardless of what is
+    actually installed.
+
+    The node headers say which is current. Each carries a `version` counter
+    that increments per write, so the newest dirent for a name gives the live
+    inode, and that inode's data nodes applied in version order give its
+    contents. Only files small enough to be settings are assembled; this is
+    for reading a version string, not for mounting a filesystem.
+    """
+    dirents: dict[bytes, tuple[int, int]] = {}
+    inodes: dict[int, list[tuple[int, int, int, int, int]]] = {}
+
+    for match in re.finditer(re.escape(JFFS2_MAGIC), data):
+        offset = match.start()
+        node = _jffs2_node(data, offset)
+        if node is None:
+            continue
+        nodetype, _totlen = node
+        if nodetype == 0xE001 and offset + 40 <= len(data):
+            _pino, version, ino = struct.unpack_from("<III", data, offset + 12)
+            nsize = data[offset + 28]
+            name = data[offset + 40 : offset + 40 + nsize]
+            if len(name) == nsize and (name not in dirents or version > dirents[name][0]):
+                dirents[name] = (version, ino)
+        elif nodetype == 0xE002 and offset + 68 <= len(data):
+            ino, version = struct.unpack_from("<II", data, offset + 12)
+            file_offset, csize, dsize = struct.unpack_from("<III", data, offset + 44)
+            compr = data[offset + 56]
+            inodes.setdefault(ino, []).append(
+                (version, offset, file_offset, csize, dsize, compr)
+            )
+
+    files: dict[bytes, tuple[bytes, int]] = {}
+    for name, (_version, ino) in dirents.items():
+        # ino 0 in the newest dirent means the name was unlinked.
+        if not ino:
+            continue
+        content = _jffs2_content(data, inodes.get(ino, []))
+        if content is not None:
+            files[name] = content
+    return files
+
+
+def _jffs2_content(
+    data: bytes, nodes: list[tuple[int, int, int, int, int, int]]
+) -> tuple[bytes, int] | None:
+    """Apply an inode's data nodes in version order. Returns (bytes, offset)."""
+    out = bytearray()
+    newest = 0
+    for _version, offset, file_offset, csize, dsize, compr in sorted(nodes):
+        if file_offset > MAX_SETTINGS_FILE or dsize > MAX_SETTINGS_FILE:
+            return None
+        payload = data[offset + 68 : offset + 68 + csize]
+        if compr == JFFS2_COMPR_NONE:
+            chunk = payload
+        elif compr == JFFS2_COMPR_ZLIB:
+            try:
+                chunk = zlib.decompress(payload)
+            except zlib.error:
+                return None
+        else:
+            return None
+        if len(chunk) < dsize:
+            return None
+        if len(out) < file_offset:
+            out += bytes(file_offset - len(out))
+        out[file_offset : file_offset + dsize] = chunk[:dsize]
+        newest = offset
+    if not out:
+        return None
+    return bytes(out), newest
+
+
+def _settings_value(content: bytes, keys: tuple[str, ...]) -> str | None:
+    """Pull the first of ``keys`` out of `key=value` text."""
+    text = content.decode("utf-8", errors="replace")
+    for key in keys:
+        match = re.search(rf"^{re.escape(key)}\s*=\s*(\S+)", text, re.MULTILINE)
+        if match:
+            return match.group(1).strip('"')
+    return None
+
+
+def firmware_version(data: bytes) -> FirmwareVersion | None:
+    """Read the firmware version out of a whole-chip dump.
+
+    The camera's settings partition holds a couple of tiny text files its
+    updater writes, and those are the only place in a dump that says which
+    firmware it was running: the kernel and rootfs are compressed, and the
+    bootloader's version is its own, not the firmware's.
+    """
+    files = _jffs2_files(data)
+    model = vendor = None
+    for name, keys in DEVICE_FILES.items():
+        content = files.get(name)
+        if content is not None:
+            model = _settings_value(content[0], keys[:1])
+            vendor = _settings_value(content[0], keys[1:])
+            break
+
+    for name, keys in VERSION_FILES.items():
+        content = files.get(name)
+        if content is None:
+            continue
+        version = _settings_value(content[0], keys)
+        if version:
+            return FirmwareVersion(
+                version=version,
+                source=name.decode(),
+                offset=content[1],
+                model=model,
+                vendor=vendor,
+            )
+    return None
 
 
 def _jffs2_regions(data: bytes) -> list[Finding]:
@@ -328,10 +525,16 @@ def inspect_image(path: Path) -> ImageReport:
     for match in re.finditer(re.escape(GZIP_MAGIC), data[: ERASE_BLOCK * 4]):
         report.findings.append(_gzip(data, match.start()))
 
-    for finding in _jffs2_regions(data):
+    jffs2 = _jffs2_regions(data)
+    for finding in jffs2:
         report.findings.append(finding)
 
     report.findings.sort(key=lambda f: f.offset)
+
+    # Only worth walking the nodes when there is a settings partition to walk;
+    # a lone kernel or a packaged update has nothing to say about versions.
+    if jffs2:
+        report.firmware = firmware_version(data)
 
     if not report.is_chip_sized:
         nearest = min(KNOWN_CHIP_SIZES, key=lambda s: abs(s - report.size))

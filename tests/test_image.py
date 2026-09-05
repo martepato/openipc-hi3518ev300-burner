@@ -17,16 +17,46 @@ def _uimage(name: str, data_size: int, load: int = 0x40008000) -> bytes:
     return bytes(header)
 
 
+def _jffs2_node(nodetype: int, body: bytes = b"") -> bytes:
+    """One JFFS2 node with a valid header and header CRC.
+
+    The CRC is not decoration: the scanner checks it, because magic plus type
+    alone still matches noise on a 16 MiB image.
+    """
+    from hisiburn.image import jffs2_header_crc
+
+    node = bytearray(12 + len(body))
+    struct.pack_into("<HHI", node, 0, 0x1985, nodetype, len(node))
+    struct.pack_into("<I", node, 8, jffs2_header_crc(bytes(node[:8])))
+    node[12:] = body
+    # totlen is the unpadded length, but the next node still has to start on a
+    # four-byte boundary or the scanner will not look at it.
+    return bytes(node) + bytes(-len(node) % 4)
+
+
 def _jffs2_nodes(count: int = 6) -> bytes:
     """A run of JFFS2 nodes: a cleanmarker followed by inodes."""
-    out = bytearray()
-    struct.pack_into("<HHI", (first := bytearray(12)), 0, 0x1985, 0x2003, 12)
-    out += first
+    out = bytearray(_jffs2_node(0x2003))
     for _ in range(count - 1):
-        node = bytearray(64)
-        struct.pack_into("<HHI", node, 0, 0x1985, 0xE002, 64)
-        out += node
+        out += _jffs2_node(0xE002, bytes(52))
     return bytes(out)
+
+
+def _jffs2_file(name: bytes, content: bytes, ino: int, version: int = 1) -> bytes:
+    """A dirent naming ``ino`` plus the data node holding its contents."""
+    dirent = bytearray(28 + len(name))
+    struct.pack_into("<III", dirent, 0, 1, version, ino)  # pino, version, ino
+    dirent[16] = len(name)  # nsize
+    dirent[17] = 8  # DT_REG
+    dirent[28:] = name
+
+    inode = bytearray(56 + len(content))
+    struct.pack_into("<II", inode, 0, ino, version)  # ino, version
+    struct.pack_into("<III", inode, 32, 0, len(content), len(content))  # off, csize, dsize
+    inode[44] = 0  # compression: none
+    inode[56:] = content
+
+    return _jffs2_node(0xE001, bytes(dirent)) + _jffs2_node(0xE002, bytes(inode))
 
 
 def _squashfs(inodes: int, bytes_used: int, block_size: int = 131072) -> bytes:
@@ -454,3 +484,121 @@ def test_a_non_uboot_file_reports_nothing(tmp_path):
     from hisiburn.image import inspect_uboot
 
     assert inspect_uboot(b"\x00" * 4096) is None
+
+
+# --- reading a firmware version out of a dump -------------------------------
+
+
+def _settings(files: list[tuple[bytes, bytes, int, int]]) -> bytes:
+    """A settings partition: a cleanmarker, then a dirent+inode per file."""
+    out = bytearray(_jffs2_node(0x2003))
+    for name, content, ino, version in files:
+        out += _jffs2_file(name, content, ino, version)
+    return bytes(out)
+
+
+def test_the_firmware_version_comes_out_of_os_release():
+    from hisiburn.image import firmware_version
+
+    report = firmware_version(
+        _settings([(b"os-release", b"ISA_VERSION=4.5.6_0168\n", 8, 1)])
+    )
+    assert report is not None
+    assert report.version == "4.5.6_0168"
+    assert report.source == "os-release"
+
+
+def test_app_ver_is_read_when_os_release_is_missing():
+    from hisiburn.image import firmware_version
+
+    report = firmware_version(
+        _settings([(b"app.ver", b"[VER]\nappver=4.0.5_0105\n", 39, 2)])
+    )
+    assert report is not None
+    assert report.version == "4.0.5_0105"
+    assert report.source == "app.ver"
+
+
+def test_the_newest_node_wins_not_the_last_one_in_the_file():
+    """The point of parsing JFFS2 rather than grepping for a version string.
+
+    A log-structured filesystem keeps every write, so a dump holds every
+    version the file ever had — the real dumps behind this carry `4.0.4_0073`
+    and two dozen copies of `4.0.5_0105` whatever is actually installed. Only
+    the node version counters say which one is live, and they need not agree
+    with the order the nodes were written down in.
+    """
+    from hisiburn.image import firmware_version
+
+    report = firmware_version(
+        _settings([
+            (b"os-release", b"ISA_VERSION=4.0.4_0073\n", 8, 1),
+            (b"os-release", b"ISA_VERSION=4.5.6_0168\n", 8, 9),  # the live one
+            (b"os-release", b"ISA_VERSION=4.0.5_0105\n", 8, 4),  # written last
+        ])
+    )
+    assert report is not None
+    assert report.version == "4.5.6_0168"
+
+
+def test_an_unlinked_name_is_not_reported():
+    from hisiburn.image import firmware_version
+
+    version = firmware_version(
+        _settings([
+            (b"os-release", b"ISA_VERSION=4.0.5_0105\n", 8, 1),
+            (b"os-release", b"", 0, 7),  # ino 0: the name was deleted
+        ])
+    )
+    assert version is None
+
+
+def test_the_model_is_read_but_the_camera_credentials_are_not():
+    """`.product_config` holds a cloud auth key and P2P id beside the model.
+
+    Only the two harmless keys are read, so no summary of a dump can put
+    someone's credentials into a terminal or a pasted bug report.
+    """
+    from hisiburn.image import firmware_version
+
+    report = firmware_version(
+        _settings([
+            (b"os-release", b"ISA_VERSION=4.5.6_0168\n", 8, 1),
+            (
+                b".product_config",
+                b"PRODUCT_TYPE=hlc6\nPRODUCT_MODEL=isa.camera.hlc6\n"
+                b"KEY=s3cret\nCONFIG_INFO_AUTHKEY=alsosecret\n",
+                9,
+                1,
+            ),
+        ])
+    )
+    assert report is not None
+    assert report.model == "isa.camera.hlc6"
+    assert report.vendor == "hlc6"
+    rendered = str(report)
+    assert "s3cret" not in rendered and "alsosecret" not in rendered
+
+
+def test_an_image_with_no_settings_partition_reports_no_version():
+    from hisiburn.image import firmware_version
+
+    assert firmware_version(b"\xff" * 4096) is None
+
+
+def test_a_dump_shows_its_firmware_version_in_the_report(tmp_path):
+    """So `inspect` and the `restore` preamble both say what it is."""
+    image = bytearray(b"\xff" * (16 * 1024 * 1024))
+    image[0x47B0 : 0x47B0 + 3] = b"\x1f\x8b\x08"
+    image[0x40000 : 0x40000 + 64] = _uimage("Linux-4.9.37", 1_916_762)
+    image[0x230000 : 0x230000 + 96] = _squashfs(495, 3_513_074)
+    settings = _settings([(b"os-release", b"ISA_VERSION=4.5.6_0168\n", 8, 1)])
+    image[0xF90000 : 0xF90000 + len(settings)] = settings
+
+    path = tmp_path / "dump.bin"
+    path.write_bytes(bytes(image))
+
+    report = inspect_image(path)
+    assert report.firmware is not None
+    assert report.firmware.version == "4.5.6_0168"
+    assert "firmware: 4.5.6_0168" in report.describe()

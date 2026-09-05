@@ -518,9 +518,12 @@ def cmd_restore(args: argparse.Namespace) -> int:
         return 0
 
     if not args.yes:
+        installing = (
+            f" — installing {report.firmware.version}" if report.firmware else ""
+        )
         print(
             f"This overwrites the ENTIRE {len(data) / 1024 / 1024:.0f} MiB chip, "
-            "bootloader included."
+            f"bootloader included{installing}."
         )
         print(
             "Recovery if it goes wrong: hold reset while plugging in, then run "

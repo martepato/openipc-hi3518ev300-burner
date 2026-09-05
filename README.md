@@ -203,6 +203,7 @@ hisiburn inspect factory.bin
 ```
 factory.bin: 16,777,216 bytes (16.00 MiB)
 verdict: full 16 MiB flash dump — write it verbatim from offset 0
+firmware: 4.0.5_0105 on isa.camera.hlc6 (from os-release at 0x00F9AE74)
 
 contents:
   0x000047B0 gzip                   compressed "u-boot.bin"
@@ -215,6 +216,24 @@ inferred partition extents:
   0x00040000   1984 KiB  uImage
   ...
 ```
+
+**It says which firmware a dump was taken from.** `restore` prints the same
+line before asking for confirmation, so two dumps of the same camera are told
+apart by what they hold rather than by what you called the files.
+
+The version comes from the settings partition, where the camera's own updater
+writes it — `os-release`, or `app.ver` on older firmware. Note that grepping a
+dump for a version string does *not* work: JFFS2 appends rather than
+overwrites, so a dump keeps every version the file ever had. A dump taken from
+a camera running 4.5.6_0168 holds two copies of `4.5.6_0168` — and thirty-one
+of `4.0.5_0105`, plus one of `4.0.4_0073`, from firmware long since replaced.
+The node headers carry version counters that say which is live, so those are
+what get read.
+
+Only the version, model and vendor are read out of that partition. The same
+files hold the camera's MAC, its cloud device id and its cloud auth key, and
+those are deliberately never printed — a summary of a dump should not be how
+someone's credentials end up in a scrollback or a pasted bug report.
 
 A vendor SD-card recovery image is recognised for what it is and refused:
 

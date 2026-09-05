@@ -431,6 +431,48 @@ Two consequences:
 Nothing here is specific to this tool: any host tool that loads this U-Boot to
 reach the flash has the same effect, HiTool included.
 
+## Which firmware a dump came from
+
+Nothing on the wire says this — it is a property of the image, and worth
+recording because the obvious method is wrong.
+
+The kernel and rootfs are compressed, and the bootloader's version string is
+its own rather than the firmware's. What does say is the settings partition at
+0xF90000: a JFFS2 area holding a few tiny text files the camera's updater
+writes, `os-release` (`ISA_VERSION=`) and, on older firmware, `app.ver`
+(`appver=`).
+
+**Grepping for the version string does not work.** JFFS2 is log-structured: a
+write appends a new node and leaves the old one in place, so a dump carries
+every version a file ever had. A dump taken from a camera running 4.5.6_0168
+contains two copies of `4.5.6_0168`, thirty-one of `4.0.5_0105` and one of
+`4.0.4_0073` — and the live one is neither the first nor, reliably, the last.
+
+The node headers settle it. Each dirent and inode node carries a `version`
+counter that increments per write, so the newest dirent for a name gives the
+live inode, and that inode's data nodes applied in version order give its
+contents. A dirent whose newest version names inode 0 is a deletion.
+
+Node headers are worth validating properly while walking them: magic (0x1985)
+and node type alone still match noise about once per 64 KiB, and a false
+dirent would name a false inode and yield a plausible-looking wrong answer.
+The header CRC closes that — note that JFFS2 computes it over the first 8
+bytes with the opposite convention to zlib's, seeding with ~0 and not
+inverting the result:
+
+```python
+crc = (zlib.crc32(header[:8], 0xFFFFFFFF) ^ 0xFFFFFFFF) & 0xFFFFFFFF
+```
+
+That validated 34 of 34 nodes in a real settings partition and rejects
+everything else in a 16 MiB image.
+
+One caution about what else is in there: `device.conf` and `.product_config`
+hold the camera's MAC, its cloud device id, its P2P id and its cloud auth key
+alongside the model name. `hisiburn` reads the model and vendor keys and
+nothing else, deliberately — a tool that summarises a dump should not be how
+those end up in a scrollback.
+
 ## Provenance
 
 | Claim | Basis |
@@ -454,6 +496,8 @@ reach the flash has the same effect, HiTool included.
 | `udc_request()` breaks the live session | observed on hardware: `EIO` on the first `FB` after `sf probe` succeeded, traced to the re-init in vendor source |
 | 512-byte bulk IN buffer | vendor source (`usb3_drv.c`, `usb3_prot.c`) |
 | Read-back at ~7 ms per round trip on macOS | measured: a full-chip `md.b` backup took about two hours |
+| Firmware version lives in the settings partition | two dumps from one camera, at known firmware versions, agreeing across `os-release` and `app.ver` |
+| JFFS2 header CRC convention | 34 of 34 nodes in a real settings partition; zlib's own convention matched 0 |
 
 The last item is worth its own note. The 2 ms round trip in the Windows capture
 was extrapolated here to "about 18 minutes" for a chip that in fact took two
