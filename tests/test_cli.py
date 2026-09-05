@@ -441,3 +441,51 @@ def test_restore_explicit_uboot_wins(capsys, tmp_path, monkeypatch):
 
     main(["restore", str(dump), "-y", "--no-reset", "--uboot", str(chosen)])
     assert "my-uboot.bin" in capsys.readouterr().out
+
+
+def test_uboot_comes_from_the_environment_when_not_given(tmp_path, monkeypatch):
+    from hisiburn.cli import UBOOT_ENV_VAR, resolve_uboot
+
+    image = tmp_path / "u-boot-hi3518ev300-universal.bin"
+    image.write_bytes(b"\xa5" * 1024)
+    monkeypatch.setenv(UBOOT_ENV_VAR, str(image))
+    resolved = resolve_uboot(None)
+    assert resolved is not None and resolved.label == image.name
+
+
+def test_an_explicit_uboot_beats_the_environment(tmp_path, monkeypatch):
+    from hisiburn.cli import UBOOT_ENV_VAR, resolve_uboot
+
+    (tmp_path / "env-uboot.bin").write_bytes(b"\x00" * 16)
+    chosen = tmp_path / "u-boot.bin"
+    chosen.write_bytes(b"\x11" * 16)
+    monkeypatch.setenv(UBOOT_ENV_VAR, str(tmp_path / "env-uboot.bin"))
+    assert resolve_uboot(str(chosen)).label == "u-boot.bin"
+
+
+def test_uboot_is_found_in_the_working_directory(tmp_path, monkeypatch):
+    from hisiburn.cli import UBOOT_ENV_VAR, resolve_uboot
+
+    monkeypatch.delenv(UBOOT_ENV_VAR, raising=False)
+    (tmp_path / "u-boot-hi3518ev300-universal.bin").write_bytes(b"\xa5" * 1024)
+    monkeypatch.chdir(tmp_path)
+    assert resolve_uboot(None) is not None
+
+
+def test_no_uboot_anywhere_is_not_an_error_here(tmp_path, monkeypatch):
+    from hisiburn.cli import UBOOT_ENV_VAR, resolve_uboot
+
+    monkeypatch.delenv(UBOOT_ENV_VAR, raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert resolve_uboot(None) is None
+
+
+def test_the_missing_uboot_message_names_the_env_var(capsys, pipe, monkeypatch, tmp_path):
+    from hisiburn.cli import UBOOT_ENV_VAR
+
+    monkeypatch.delenv(UBOOT_ENV_VAR, raising=False)
+    monkeypatch.chdir(tmp_path)
+    _pipe_for_probe(pipe, monkeypatch)
+    pipe.queue_timeout(4)
+    assert main(["run", "usbtftp"]) == 1
+    assert UBOOT_ENV_VAR in capsys.readouterr().err

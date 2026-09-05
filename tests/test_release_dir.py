@@ -345,3 +345,57 @@ def test_a_uboot_without_crc32_is_explained(pipe):
     pipe.queue_command_ok("Unknown command 'crc32' - try 'help'\r\n")
     with pytest.raises(AgentError, match="CONFIG_CMD_CRC32"):
         BurnAgent(pipe).crc32(0x41000000, 4096)
+
+
+def test_verify_can_check_one_region_alone(pipe):
+    """Narrowing a mismatch means checking a slice, not the whole chip."""
+    import zlib
+
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import verify_against_image
+
+    data = bytes(range(256)) * 4096  # 1 MiB
+    kernel = data[0x40000:0x50000]
+    pipe.queue_command_ok()
+    pipe.queue_command_ok()
+    pipe.queue_command_ok(f"crc32 for x ... ==> {zlib.crc32(kernel):08x}\r\n")
+
+    assert verify_against_image(
+        BurnAgent(pipe), data, 0x41000000, lambda _: None,
+        skip=0x40000, length=0x10000, chunk_size=0x10000,
+    ) == []
+    sent = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
+    assert sent == [
+        "sf probe 0",
+        "sf read 0x41000000 0x40000 0x10000",
+        "crc32 0x41000000 0x10000",
+    ]
+
+
+def test_verify_slice_offsets_flash_and_image_together(pipe):
+    import zlib
+
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import verify_against_image
+
+    data = b"\x00" * 0x10000 + b"\xa5" * 0x10000
+    tail = data[0x10000:]
+    pipe.queue_command_ok()
+    pipe.queue_command_ok()
+    pipe.queue_command_ok(f"crc32 for x ... ==> {zlib.crc32(tail):08x}\r\n")
+
+    # A mismatch here would mean the image slice and the flash slice had
+    # drifted apart, which is the whole hazard of a --skip flag.
+    assert verify_against_image(
+        BurnAgent(pipe), data, 0x41000000, lambda _: None,
+        skip=0x10000, chunk_size=0x10000,
+    ) == []
+
+
+def test_verify_rejects_a_skip_past_the_end(pipe):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import verify_against_image
+
+    with pytest.raises(PlanError, match="past the end"):
+        verify_against_image(BurnAgent(pipe), b"x" * 1024, 0x41000000,
+                             lambda _: None, skip=4096)

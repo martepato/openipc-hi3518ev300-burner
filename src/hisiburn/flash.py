@@ -441,6 +441,8 @@ def verify_against_image(
     on_step: StepCallback,
     offset: int = 0,
     chunk_size: int = VERIFY_CHUNK,
+    skip: int = 0,
+    length: int | None = None,
 ) -> list[Mismatch]:
     """Compare flash against ``data`` by checksum, without reading it back.
 
@@ -451,6 +453,15 @@ def verify_against_image(
     """
     if not data:
         raise PlanError("refusing to verify against an empty image")
+    if skip >= len(data):
+        raise PlanError(
+            f"--skip 0x{skip:X} starts past the end of a {len(data):,}-byte image"
+        )
+
+    # A slice of the image is compared against the matching slice of flash, so
+    # a single region can be checked without re-reading the whole chip.
+    data = data[skip : None if length is None else skip + length]
+    offset += skip
 
     agent.flash_probe()
     mismatches: list[Mismatch] = []

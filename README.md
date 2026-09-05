@@ -239,7 +239,33 @@ Match: the camera's flash is byte-identical to mjsxj02hl_full-dump_4.0.5-0105_si
 Each chunk is read into DRAM and checksummed **on the device**; only the
 checksum crosses USB. That makes it fast — a whole 16 MiB chip is four round
 trips — and, more usefully, it works on a U-Boot with no device-to-host bulk
-path at all. `--offset` verifies an image that starts part-way into the chip.
+path at all.
+
+A mismatch is narrowed by checking smaller pieces, or one region alone:
+
+```sh
+hisiburn verify dump.bin --chunk 0x10000              # per 64 KiB erase block
+hisiburn verify dump.bin --skip 0x40000 --length 0x1f0000   # just the kernel
+```
+
+`--offset` is for an image that is one partition rather than a whole chip:
+it says where in flash that image belongs.
+
+**A camera that has booted will not match a dump of it.** Firmware writes its
+settings partition, and usually the U-Boot environment, on every boot. Those
+regions differing is normal; the kernel and rootfs regions differing is not.
+
+### Pointing commands at a U-Boot
+
+`flash` finds a U-Boot in the firmware directory, and `restore` can take one
+from the dump itself. `info`, `run` and `verify` have neither, so set it once:
+
+```sh
+export HISIBURN_UBOOT=~/firmware/u-boot-hi3518ev300-universal.bin
+```
+
+Failing that they look in the working directory, and `--uboot PATH` always
+wins.
 
 ### Recovering a layout from a HiBurn log
 

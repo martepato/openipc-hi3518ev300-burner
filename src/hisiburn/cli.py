@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -166,10 +167,34 @@ class UbootImage:
     label: str
 
 
+#: Set this to a U-Boot once per shell and the commands that have no firmware
+#: directory to search stop needing --uboot every time.
+UBOOT_ENV_VAR = "HISIBURN_UBOOT"
+
+
 def load_uboot(path: Path) -> UbootImage:
     if not path.is_file():
         raise CliError(f"U-Boot image not found: {path}")
     return UbootImage(path.read_bytes(), path.name)
+
+
+def resolve_uboot(explicit: str | None, *directories: Path) -> UbootImage | None:
+    """Find a U-Boot for stage 1, for commands pointed at no firmware set.
+
+    `flash` has a directory full of images to look in; `info`, `run` and
+    `verify` do not, so they fall back to an environment variable and the
+    working directory rather than demanding --uboot on every invocation.
+    """
+    if explicit:
+        return load_uboot(Path(explicit))
+    from_env = os.environ.get(UBOOT_ENV_VAR)
+    if from_env:
+        return load_uboot(Path(from_env))
+    for directory in (*directories, Path.cwd()):
+        found = find_uboot(directory)
+        if found is not None:
+            return load_uboot(found)
+    return None
 
 
 def connect_agent(
@@ -195,9 +220,10 @@ def connect_agent(
         raise CliError(
             "the device is attached but no burn agent answered. Both stages share "
             "the same USB id, so this is most likely the boot ROM still waiting "
-            "for a download, and no U-Boot image was found to send it. Pass "
-            "--uboot PATH — any U-Boot with HiSilicon's usbtftp support will do, "
-            "such as the u-boot-<soc>-universal.bin from an OpenIPC release."
+            "for a download, and no U-Boot image was found to send it.\n"
+            "Pass --uboot PATH, or set "
+            f"{UBOOT_ENV_VAR}=/path/to/u-boot-<soc>-universal.bin once per shell. "
+            "Any U-Boot for this SoC will do; it only runs from RAM."
         )
 
     print(
@@ -297,7 +323,7 @@ def _describe_pipe(pipe: BulkPipe) -> None:
 
 def cmd_info(args: argparse.Namespace) -> int:
     pipe, agent = connect_agent(
-        args.pid, args.wait, load_uboot(Path(args.uboot)) if args.uboot else None, args.chip
+        args.pid, args.wait, resolve_uboot(args.uboot), args.chip
     )
     try:
         for topic in ("version", "bootmode", "spi"):
@@ -310,7 +336,7 @@ def cmd_info(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     pipe, agent = connect_agent(
-        args.pid, args.wait, load_uboot(Path(args.uboot)) if args.uboot else None, args.chip
+        args.pid, args.wait, resolve_uboot(args.uboot), args.chip
     )
     try:
         for command in args.command:
@@ -545,16 +571,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
     data = path.read_bytes()
 
     print(f"Verifying the camera against {path.name} ({len(data):,} bytes)")
-    uboot = load_uboot(Path(args.uboot)) if args.uboot else find_uboot(path.parent)
-    if uboot is not None and not isinstance(uboot, UbootImage):
-        uboot = load_uboot(uboot)
-
-    pipe, agent = connect_agent(args.pid, args.wait, uboot=uboot, chip=args.chip)
+    pipe, agent = connect_agent(
+        args.pid, args.wait, resolve_uboot(args.uboot, path.parent), args.chip
+    )
     try:
         print()
         mismatches = verify_against_image(
             agent, data, staging=args.staging, on_step=step,
             offset=args.offset, chunk_size=args.chunk,
+            skip=args.skip, length=args.length,
         )
     finally:
         pipe.close()
@@ -779,6 +804,14 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument(
         "--staging", type=lambda v: int(v, 0), default=0x41000000, metavar="ADDR",
         help="DRAM address to read through",
+    )
+    verify.add_argument(
+        "--skip", type=lambda v: int(v, 0), default=0, metavar="BYTES",
+        help="ignore this much from the start of the image (and of flash)",
+    )
+    verify.add_argument(
+        "--length", type=lambda v: int(v, 0), metavar="BYTES",
+        help="verify only this many bytes, so one region can be checked alone",
     )
     verify.set_defaults(func=cmd_verify)
 
