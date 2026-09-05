@@ -12,15 +12,18 @@ from hisiburn import __version__
 from hisiburn.agent import AgentError, BurnAgent
 from hisiburn.bootrom import PROFILES, BootRom, BootRomError
 from hisiburn.flash import (
+    RESTORE_CHUNK,
     PlanError,
     build_plan,
     find_uboot,
     run_plan,
+    run_restore,
     verify_checksums,
     verify_flash_chip,
 )
 from hisiburn.hitool_log import LogParseError, layout_from_log, parse_sessions
 from hisiburn.hitool_xml import XmlParseError, find_partition_table, layout_from_xml
+from hisiburn.image import inspect_image
 from hisiburn.layout import BUILTIN_LAYOUTS, FlashLayout, LayoutError, get_layout
 from hisiburn.usbdev import (
     BackendMissing,
@@ -399,6 +402,81 @@ def cmd_flash(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_inspect(args: argparse.Namespace) -> int:
+    path = Path(args.image)
+    if not path.is_file():
+        raise CliError(f"image not found: {path}")
+    print(inspect_image(path).describe())
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    path = Path(args.image)
+    if not path.is_file():
+        raise CliError(f"image not found: {path}")
+
+    report = inspect_image(path)
+    print(report.describe())
+    print()
+
+    if not report.is_full_dump and not args.force:
+        raise CliError(
+            "this does not look like a whole-chip dump, and restore writes an "
+            "image verbatim from offset 0. Use `hisiburn flash` for a firmware "
+            "set with a partition table, or --force if you are sure."
+        )
+
+    data = path.read_bytes()
+    if args.dry_run:
+        for offset in range(0, len(data), args.chunk):
+            end = min(offset + args.chunk, len(data))
+            print(f"  erase and write 0x{offset:07X}..0x{end:07X}")
+        print("  reset")
+        return 0
+
+    if not args.yes:
+        print(
+            f"This overwrites the ENTIRE {len(data) / 1024 / 1024:.0f} MiB chip, "
+            "bootloader included."
+        )
+        print(
+            "Recovery if it goes wrong: hold reset while plugging in, then run "
+            "`hisiburn flash` again — the boot ROM is in mask ROM and cannot be "
+            "overwritten."
+        )
+        if input("Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+
+    uboot = Path(args.uboot) if args.uboot else None
+    pipe, agent = connect_agent(args.pid, args.wait, uboot=uboot, chip=args.chip)
+    try:
+        print("\nRestoring:")
+        info = agent.get_info("spi")
+        step(f"flash: {' '.join(info.split())}")
+        import re as _re
+
+        match = _re.search(r"Chip:(\d+)MB", info)
+        if match:
+            reported = int(match.group(1)) * 1024 * 1024
+            if reported != len(data) and not args.force:
+                raise PlanError(
+                    f"the camera has a {reported // (1024 * 1024)} MiB chip but the "
+                    f"image is {len(data) / 1024 / 1024:.2f} MiB. Restoring it would "
+                    "leave the chip half-written; --force overrides."
+                )
+        run_restore(
+            agent, data, staging=args.staging, on_step=step,
+            on_progress=ProgressBar("upload"), chunk_size=args.chunk,
+            reset=not args.no_reset,
+        )
+    finally:
+        pipe.close()
+
+    print("\nDone. The camera should reboot into the restored firmware.")
+    return 0
+
+
 def cmd_from_log(args: argparse.Namespace) -> int:
     path = Path(args.log)
     sessions = parse_sessions(path.read_text(errors="replace"))
@@ -558,6 +636,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip checking the images against a shipped md5sums/sha256sums file",
     )
     flash.set_defaults(func=cmd_flash)
+
+    inspect = sub.add_parser(
+        "inspect", parents=[general],
+        help="say what a firmware .bin actually is, without writing anything",
+    )
+    inspect.add_argument("image", help="firmware file to examine")
+    inspect.set_defaults(func=cmd_inspect)
+
+    restore = sub.add_parser(
+        "restore", parents=[general, device, booting],
+        help="write a whole-chip dump back verbatim",
+    )
+    restore.add_argument("image", help="full flash image")
+    restore.add_argument(
+        "--chunk", type=lambda v: int(v, 0), default=RESTORE_CHUNK,
+        metavar="BYTES", help="how much to stage at a time (default 4 MiB)",
+    )
+    restore.add_argument(
+        "--staging", type=lambda v: int(v, 0), default=0x41000000,
+        metavar="ADDR", help="DRAM address to stage through",
+    )
+    restore.add_argument("--dry-run", action="store_true", help="print the plan only")
+    restore.add_argument("-y", "--yes", action="store_true", help="skip the confirmation")
+    restore.add_argument("--no-reset", action="store_true", help="leave the camera halted")
+    restore.add_argument(
+        "--force", action="store_true",
+        help="write even if the image is not a recognisable whole-chip dump, "
+             "or does not match the chip size",
+    )
+    restore.set_defaults(func=cmd_restore)
 
     from_log = sub.add_parser(
         "from-log", parents=[general],

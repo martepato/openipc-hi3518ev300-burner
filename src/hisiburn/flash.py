@@ -25,7 +25,14 @@ from hisiburn.agent import (
     probe_command,
     write_command,
 )
-from hisiburn.layout import BOOTLOADER_NAMES, FlashLayout, LayoutError, Partition, round_up
+from hisiburn.layout import (
+    BOOTLOADER_NAMES,
+    ERASE_BLOCK,
+    FlashLayout,
+    LayoutError,
+    Partition,
+    round_up,
+)
 
 log = logging.getLogger(__name__)
 
@@ -334,3 +341,69 @@ def find_uboot(directory: Path, layout: FlashLayout | None = None) -> Path | Non
             # random is worse than saying so.
             return None
     return None
+
+
+# --- whole-chip restore -----------------------------------------------------
+
+#: How much of a full-chip image to stage in DRAM at a time. The staging area
+#: sits at 0x41000000 and the boards this targets have 64 MiB, so a few MiB is
+#: comfortable while a whole 16 MiB image would not be.
+RESTORE_CHUNK = 4 * 1024 * 1024
+
+
+def run_restore(
+    agent: BurnAgent,
+    data: bytes,
+    staging: int,
+    on_step: StepCallback,
+    on_progress: ProgressCallback | None = None,
+    chunk_size: int = RESTORE_CHUNK,
+    reset: bool = True,
+) -> None:
+    """Write a whole-flash image verbatim, a chunk at a time.
+
+    A full dump is defined by its offsets, so it goes down exactly as it is
+    rather than being split across a partition table — the table it was taken
+    from is very likely not the one this tool knows about.
+
+    Each chunk is erased immediately before it is written, which keeps the
+    blank window short and means an interrupted restore has only lost the
+    region it was working on.
+    """
+    if not data:
+        raise PlanError("refusing to restore an empty image")
+    if chunk_size % ERASE_BLOCK:
+        raise PlanError(
+            f"chunk size 0x{chunk_size:X} is not a multiple of the "
+            f"{ERASE_BLOCK // 1024} KiB erase block"
+        )
+
+    agent.flash_probe()
+    total = len(data)
+    written = 0
+
+    for offset in range(0, total, chunk_size):
+        piece = data[offset : offset + chunk_size]
+        # The tail of the image may not fill a whole erase block; pad it with
+        # 0xFF so what lands in flash matches an erased chip rather than
+        # whatever preceded it.
+        padded = round_up(len(piece))
+        piece = piece.ljust(padded, b"\xff")
+
+        label = f"0x{offset:07X}..0x{offset + padded:07X}"
+        on_step(f"{label}: erasing")
+        agent.flash_erase(offset, padded)
+
+        on_step(f"{label}: staging {len(piece):,} bytes")
+        agent.memset(staging, 0xFF, padded)
+        agent.upload(piece, staging, on_progress=on_progress)
+
+        on_step(f"{label}: writing")
+        agent.flash_write(staging, offset, padded)
+
+        written += len(piece)
+        on_step(f"{label}: done ({written / total * 100:.0f}% of the image)")
+
+    if reset:
+        on_step("resetting the camera")
+        agent.reset()

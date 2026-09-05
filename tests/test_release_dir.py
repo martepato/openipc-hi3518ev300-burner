@@ -179,3 +179,82 @@ def test_ambiguous_uboot_candidates_are_not_guessed_between(release):
 
     (release / "u-boot-old.bin").write_bytes(b"\x00" * 1024)
     assert find_uboot(release) is None
+
+
+# --- whole-chip restore -----------------------------------------------------
+
+
+def _queue_restore(pipe, chunks: int) -> None:
+    """Replies for a restore: one probe, then erase/fill/upload/write per chunk."""
+    pipe.queue_command_ok()  # sf probe 0, once at the start
+    for _ in range(chunks):
+        pipe.queue_command_ok()  # sf erase
+        pipe.queue_command_ok()  # mw.b
+        pipe.queue_ack(3)  # upload sync, header, tail
+        pipe.queue_command_ok()  # sf write
+
+
+def test_restore_writes_the_image_in_erase_block_aligned_chunks(pipe):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_restore
+
+    data = bytes(range(256)) * 4096  # 1 MiB
+    chunk = 256 * 1024
+    _queue_restore(pipe, chunks=len(data) // chunk)
+
+    run_restore(BurnAgent(pipe), data, staging=0x41000000,
+                on_step=lambda _: None, chunk_size=chunk, reset=False)
+
+    commands = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
+    erases = [c for c in commands if c.startswith("sf erase")]
+    writes = [c for c in commands if c.startswith("sf write")]
+    assert erases == [f"sf erase 0x{o:x} 0x{chunk:x}" for o in range(0, len(data), chunk)]
+    assert writes == [
+        f"sf write 0x41000000 0x{o:x} 0x{chunk:x}" for o in range(0, len(data), chunk)
+    ]
+
+
+def test_restore_sends_the_image_bytes_unchanged(pipe):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_restore
+
+    data = bytes(range(256)) * 1024  # 256 KiB, one chunk
+    _queue_restore(pipe, chunks=1)
+
+    run_restore(BurnAgent(pipe), data, staging=0x41000000,
+                on_step=lambda _: None, chunk_size=len(data), reset=False)
+    uploaded = b"".join(f for f in pipe.writes if len(f) > 512)
+    assert uploaded == data
+
+
+def test_restore_pads_a_short_final_chunk_to_an_erase_block(pipe):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_restore
+
+    data = b"\xa5" * (64 * 1024 + 100)  # one block plus a bit
+    _queue_restore(pipe, chunks=2)
+
+    run_restore(BurnAgent(pipe), data, staging=0x41000000,
+                on_step=lambda _: None, chunk_size=64 * 1024, reset=False)
+    uploaded = b"".join(f for f in pipe.writes if len(f) > 512)
+    # Padded up with 0xFF, which is what an erased chip reads as.
+    assert len(uploaded) == 128 * 1024
+    assert uploaded[: len(data)] == data
+    assert set(uploaded[len(data):]) == {0xFF}
+
+
+def test_restore_rejects_a_misaligned_chunk_size(pipe):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_restore
+
+    with pytest.raises(PlanError, match="erase block"):
+        run_restore(BurnAgent(pipe), b"x" * 1024, staging=0x41000000,
+                    on_step=lambda _: None, chunk_size=1000)
+
+
+def test_restore_rejects_an_empty_image(pipe):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_restore
+
+    with pytest.raises(PlanError, match="empty image"):
+        run_restore(BurnAgent(pipe), b"", staging=0x41000000, on_step=lambda _: None)

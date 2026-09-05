@@ -155,6 +155,54 @@ spi        Block:64KB Chip:16MB*1 ID:0x1C 0x70 0x18 Name:"EN25QH128A"
 `info` and `run` will also start the agent themselves if you give them
 `--uboot PATH`.
 
+### Working out what a firmware file is
+
+A `.bin` handed round as "the factory firmware" can be a raw dump of a whole
+flash chip or a packaged update, and they are written completely differently.
+`inspect` says which, without touching the camera:
+
+```sh
+hisiburn inspect factory.bin
+```
+
+```
+factory.bin: 16,777,216 bytes (16.00 MiB)
+verdict: full 16 MiB flash dump — write it verbatim from offset 0
+
+contents:
+  0x000047B0 gzip                   compressed "u-boot.bin"
+  0x00040000 uImage      1,916,698  "Linux-4.9.37", OS kernel, Linux, load 0x40008000
+  0x00230000 squashfs    3,513,074  495 inodes, 128 KiB blocks
+  ...
+
+inferred partition extents:
+  0x00000000    256 KiB  bootloader
+  0x00040000   1984 KiB  uImage
+  ...
+```
+
+A vendor SD-card recovery image is recognised for what it is and refused:
+
+```
+verdict: a U-Boot firmware update package ("hlc6") — meant for the camera's
+own updater (the SD-card recovery procedure), not for writing to flash
+```
+
+### Restoring a whole-chip dump
+
+```sh
+hisiburn restore factory.bin
+```
+
+Writes the image verbatim from offset 0, erasing and writing a few MiB at a
+time so the staging area never has to hold the whole chip. Use this rather
+than `flash` for a dump: its partition layout is whatever the camera it came
+from used, which is very likely not the one `flash` knows.
+
+It refuses anything that does not look like a whole-chip dump, and refuses a
+size that does not match the chip. `--force` overrides both, `--dry-run`
+prints the plan.
+
 ### Recovering a layout from a HiBurn log
 
 If you have no partition table but have flashed this camera from Windows
