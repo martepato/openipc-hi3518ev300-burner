@@ -47,9 +47,10 @@ for the SoC will do; OpenIPC publishes one per SoC as
 curl -LO https://github.com/OpenIPC/firmware/releases/download/latest/u-boot-hi3518ev300-universal.bin
 ```
 
-`flash` finds it automatically in the firmware directory, and `restore` can
-take one out of a whole-chip dump. `info`, `run`, `peek` and `verify` have
-nowhere to look, so pass `--uboot PATH` (or set `HISIBURN_UBOOT`).
+`flash` finds it automatically in the firmware directory, and any command
+pointed at a whole-chip dump — `restore`, `verify`, `peek --image` — can take
+one out of the dump itself. `info`, `run` and `backup` have nowhere to look, so
+pass `--uboot PATH` (or set `HISIBURN_UBOOT`).
 
 **libusb**, the only native dependency:
 
@@ -254,8 +255,19 @@ prints the plan.
 
 Stage 1 still needs a U-Boot to run, and a lone image file has no firmware
 directory to find one in — so a full dump supplies its own, from the
-bootloader at its offset 0. `--uboot PATH` overrides that, and a U-Boot
-sitting next to the image is preferred over the embedded one.
+bootloader at its offset 0. This holds for every command pointed at a whole
+image, `verify` and `peek --image` included: an image you can restore without
+`--uboot` is one you can verify without it too.
+
+The order is `--uboot`, then `$HISIBURN_UBOOT`, then a U-Boot beside the image
+or in the working directory, then the one inside the image. Whichever wins is
+named on the `Boot ROM is listening — loading …` line, which is worth reading:
+a *stock* U-Boot writes its own environment to flash the moment it starts (see
+below), and the copy inside a factory dump is a stock one.
+
+`backup` is the exception, since it is pointed at a file it is about to create
+rather than one that exists. It needs `--uboot`, `$HISIBURN_UBOOT`, or a U-Boot
+in the working directory.
 
 ### Backing up a camera's flash
 

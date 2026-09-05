@@ -426,6 +426,41 @@ def test_restore_prefers_a_uboot_beside_the_image(capsys, tmp_path, monkeypatch)
     assert "from the image itself" not in out
 
 
+def test_verify_uses_the_bootloader_inside_the_dump(capsys, tmp_path, monkeypatch):
+    """The same dump restore could start the agent with, verify can too.
+
+    These went through different resolvers once, so an image that restored
+    without --uboot then failed to verify without one — with nothing about the
+    image having changed in between.
+    """
+    from conftest import FakePipe
+
+    dump = _dump_with_bootloader(tmp_path)
+    bootrom = FakePipe()
+    _agent_pipe(monkeypatch, [bootrom])
+    bootrom.queue_timeout(2)
+    bootrom.queue(b"\x55")  # refuse stage 1, so the run stops after the choice
+
+    main(["verify", str(dump)])
+    out = capsys.readouterr().out
+    assert "using the bootloader from the image itself" in out
+    assert bootrom.writes, "stage 1 was attempted rather than refused for want of a loader"
+
+
+def test_peek_uses_the_bootloader_inside_the_dump(capsys, tmp_path, monkeypatch):
+    """peek narrows a verify mismatch, so it is pointed at the same image."""
+    from conftest import FakePipe
+
+    dump = _dump_with_bootloader(tmp_path)
+    bootrom = FakePipe()
+    _agent_pipe(monkeypatch, [bootrom])
+    bootrom.queue_timeout(2)
+    bootrom.queue(b"\x55")
+
+    main(["peek", "0x40000", "--image", str(dump)])
+    assert "using the bootloader from the image itself" in capsys.readouterr().out
+
+
 def test_restore_explicit_uboot_wins(capsys, tmp_path, monkeypatch):
     from conftest import FakePipe
 

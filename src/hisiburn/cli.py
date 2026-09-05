@@ -532,7 +532,10 @@ def cmd_restore(args: argparse.Namespace) -> int:
             return 1
 
     pipe, agent = connect_agent(
-        args.pid, args.wait, uboot=_uboot_for_restore(args, report, data), chip=args.chip
+        args.pid,
+        args.wait,
+        uboot=uboot_for_image(args.uboot, path, data, args.chip),
+        chip=args.chip,
     )
     try:
         print("\nRestoring:")
@@ -583,37 +586,43 @@ def cmd_restore(args: argparse.Namespace) -> int:
     return 0
 
 
-def _uboot_for_restore(
-    args: argparse.Namespace, report: object, data: bytes
+def uboot_for_image(
+    explicit: str | None, image: Path, data: bytes, chip: str
 ) -> UbootImage | None:
-    """Find a U-Boot to start the agent with, for a lone image file.
+    """Find a U-Boot for a command pointed at a single image file.
 
-    Unlike `flash`, restore is pointed at one file rather than a firmware
-    directory, so there may be no loader sitting beside it. A full dump
-    carries one at offset 0, which is the bootloader that camera ran, so it
-    can supply its own.
+    `resolve_uboot`'s sources first — ``--uboot``, the environment variable, a
+    loader beside the image or in the working directory — and then the image
+    itself. That last source is what makes a whole-chip dump self-sufficient:
+    it carries at offset 0 the bootloader the camera it came from was running,
+    and stage 1 only ever runs a loader out of RAM, so the copy inside the dump
+    serves as well as any other.
+
+    Every command handed a whole image goes through here, so a dump that can be
+    restored without ``--uboot`` can be verified and peeked at without one too.
+    Nothing about the image changes between those commands; only which of them
+    bothered to look would have.
     """
-    if args.uboot:
-        return load_uboot(Path(args.uboot))
-
-    beside = find_uboot(Path(args.image).parent)
-    if beside is not None:
-        return load_uboot(beside)
+    found = resolve_uboot(explicit, Path(image).parent)
+    if found is not None:
+        return found
 
     from hisiburn.image import bootloader_from_dump
 
-    embedded = bootloader_from_dump(report, data, minimum=_profile_for(args.chip).spl_size)
-    if embedded is not None:
-        print(
-            f"No separate U-Boot found; using the bootloader from the image "
-            f"itself ({len(embedded):,} bytes at offset 0)."
-        )
-        print(
-            "  If the camera does not come back as a burn agent, pass --uboot "
-            "with a U-Boot known to have usbtftp support."
-        )
-        return UbootImage(embedded, "bootloader from the image")
-    return None
+    embedded = bootloader_from_dump(
+        inspect_image(Path(image)), data, minimum=_profile_for(chip).spl_size
+    )
+    if embedded is None:
+        return None
+    print(
+        f"No separate U-Boot found; using the bootloader from the image itself "
+        f"({len(embedded):,} bytes at offset 0)."
+    )
+    print(
+        "  If the camera does not come back as a burn agent, pass --uboot with "
+        "a U-Boot known to work on this SoC."
+    )
+    return UbootImage(embedded, "bootloader from the image")
 
 
 def _hexdump(data: bytes, base: int, other: bytes | None = None) -> str:
@@ -634,16 +643,20 @@ def _hexdump(data: bytes, base: int, other: bytes | None = None) -> str:
 def cmd_peek(args: argparse.Namespace) -> int:
     """Show the actual bytes at a flash offset, for narrowing a mismatch."""
     expected: bytes | None = None
+    uboot: UbootImage | None = None
     if args.image:
         path = Path(args.image)
         if not path.is_file():
             raise CliError(f"image not found: {path}")
         blob = path.read_bytes()
         expected = blob[args.offset : args.offset + args.length]
+        # A peek is usually narrowing a verify mismatch, so it is pointed at
+        # the same image and can take a loader from it the same way.
+        uboot = uboot_for_image(args.uboot, path, blob, args.chip)
+    else:
+        uboot = resolve_uboot(args.uboot)
 
-    pipe, agent = connect_agent(
-        args.pid, args.wait, resolve_uboot(args.uboot), args.chip
-    )
+    pipe, agent = connect_agent(args.pid, args.wait, uboot, args.chip)
     try:
         agent.flash_probe()
         agent.flash_read(args.staging, args.offset, max(args.length, 0x1000))
@@ -779,7 +792,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     print(f"Verifying the camera against {path.name} ({len(data):,} bytes)")
     pipe, agent = connect_agent(
-        args.pid, args.wait, resolve_uboot(args.uboot, path.parent), args.chip
+        args.pid, args.wait, uboot_for_image(args.uboot, path, data, args.chip), args.chip
     )
     try:
         print()
