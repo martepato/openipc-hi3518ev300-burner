@@ -8,6 +8,7 @@ workflow needs Zadig to swap in libusbK and this one needs nothing.
 
 from __future__ import annotations
 
+import errno as _errno
 import logging
 import platform
 import time
@@ -30,6 +31,21 @@ PRODUCT_ID = 0xD001
 KNOWN_PRODUCT_IDS = (PRODUCT_ID,)
 
 DEFAULT_TIMEOUT_MS = 5000
+
+
+#: libusb's own code for a stalled endpoint, which pyusb exposes unchanged.
+LIBUSB_ERROR_PIPE = -9
+
+
+def is_stall(exc: usb.core.USBError) -> bool:
+    """Whether a failed transfer was a stall rather than a timeout."""
+    if getattr(exc, "backend_error_code", None) == LIBUSB_ERROR_PIPE:
+        return True
+    if exc.errno == _errno.EPIPE:
+        return True
+    # Backends that report neither still say so in the message.
+    text = str(exc).lower()
+    return "stall" in text or "pipe error" in text
 
 
 class BackendMissing(Exception):
@@ -197,6 +213,7 @@ class BulkPipe:
         config = self.device.get_active_configuration()
         interface = config[(0, 0)]
         self._interface_number = interface.bInterfaceNumber
+        self._configuration_value = config.bConfigurationValue
 
         self.ep_out = usb.util.find_descriptor(
             interface,
@@ -241,9 +258,14 @@ class BulkPipe:
         """Clear a stall on both bulk endpoints.
 
         A device that does not recognise a frame can stall its endpoint, and
-        on macOS the stall persists: every later transfer fails with EIO until
-        it is cleared. Without this, one unrecognised opcode kills the pipe and
-        every subsequent operation reports a misleading I/O error.
+        on macOS the stall persists: every later transfer fails until it is
+        cleared. Without this, one unrecognised opcode kills the pipe and every
+        later operation reports a misleading I/O error.
+
+        Only call this for an actual stall. CLEAR_FEATURE(ENDPOINT_HALT) also
+        resets the endpoint's data toggle, so issuing it against a healthy
+        endpoint desynchronises host and device and the next transfers go
+        unanswered.
         """
         for endpoint in (self.ep_out, self.ep_in):
             try:
@@ -251,12 +273,38 @@ class BulkPipe:
             except usb.core.USBError as exc:
                 log.debug("clear_halt on 0x%02x failed: %s", endpoint.bEndpointAddress, exc)
 
+    def reset_configuration(self) -> None:
+        """Re-issue SET_CONFIGURATION.
+
+        Two things happen device-side, both useful. The gadget re-arms its bulk
+        OUT endpoint — which is the only way back from a frame it did not
+        recognise, since its handler simply returns without re-arming — and the
+        burn agent re-sends its "start download process." banner, which is how
+        the two stages are told apart.
+        """
+        self.device.ctrl_transfer(0x00, 0x09, self._configuration_value, 0, None,
+                                  self.timeout_ms)
+
+    def _recover(self, exc: usb.core.USBError) -> None:
+        """Clear the endpoints only when the failure was a stall.
+
+        A timeout means the device chose not to answer — the boot ROM does
+        exactly that for opcodes it does not implement — and the endpoints are
+        fine. Clearing them anyway resets the data toggle and breaks the next
+        exchange, which is worse than the timeout.
+        """
+        if is_stall(exc):
+            log.debug("endpoint stalled (%s); clearing halt", exc)
+            self.clear_halt()
+        else:
+            log.debug("transfer failed without a stall (%s); leaving endpoints alone", exc)
+
     def write(self, data: bytes, timeout_ms: int | None = None) -> int:
         """Send ``data`` on the bulk OUT endpoint."""
         try:
             return self.ep_out.write(data, timeout_ms or self.timeout_ms)
         except usb.core.USBError as exc:
-            self.clear_halt()
+            self._recover(exc)
             raise UsbError(f"bulk write of {len(data)} bytes failed: {exc}") from exc
 
     def read(self, length: int | None = None, timeout_ms: int | None = None) -> bytes:
@@ -265,7 +313,7 @@ class BulkPipe:
         try:
             return bytes(self.ep_in.read(size, timeout_ms or self.timeout_ms))
         except usb.core.USBError as exc:
-            self.clear_halt()
+            self._recover(exc)
             raise UsbError(f"bulk read failed: {exc}") from exc
 
     def read_byte(self, timeout_ms: int | None = None) -> int:

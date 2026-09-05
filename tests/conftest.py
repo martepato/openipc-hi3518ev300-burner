@@ -25,9 +25,19 @@ class FakePipe:
         self.replies: deque[bytes] = deque(replies or [])
         self.max_packet_size = max_packet_size
         self.closed = False
+        self.halts_cleared = 0
+        self.configurations_reset = 0
+        #: Set to make this pipe behave like a burn agent, which re-sends its
+        #: banner on every SET_CONFIGURATION.
+        self.greeting: bytes | None = None
 
     def queue(self, *replies: bytes) -> None:
         self.replies.extend(replies)
+
+    def be_an_agent(self, banner: bytes = b"start download process.\x00") -> None:
+        """Behave like the burn agent: greet now and on every re-configure."""
+        self.greeting = banner
+        self.replies.appendleft(banner)
 
     def queue_timeout(self, count: int = 1) -> None:
         """Queue reads that behave like a device saying nothing."""
@@ -65,7 +75,13 @@ class FakePipe:
         return data[0]
 
     def clear_halt(self) -> None:
-        pass
+        self.halts_cleared += 1
+
+    def reset_configuration(self) -> None:
+        """Re-arm and, on a real agent, re-trigger the banner."""
+        self.configurations_reset += 1
+        if self.greeting is not None:
+            self.replies.appendleft(self.greeting)
 
     def close(self) -> None:
         self.closed = True

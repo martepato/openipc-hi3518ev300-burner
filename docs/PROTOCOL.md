@@ -192,22 +192,44 @@ bytes down against the announced length and only completes on a short packet.
 
 ### Distinguishing the stages
 
-**Open with `FE <token> <token>`, not `FA`.** Both stages accept OPEN as a
-first frame — it is what HiBurn sends to the boot ROM before anything else,
-and the agent handles the same shape. `FA` was only ever observed mid-session
-against a running agent, and a real boot ROM **stalls its bulk endpoint** on
-it. On macOS that stall persists: every later transfer fails with `EIO` until
-`clear_halt` is issued, so one unrecognised opcode makes the device look dead.
+**Read the banner. Do not send a command.**
 
-An ACK to OPEN proves only that *something* is listening. The discriminator is
-a command only U-Boot implements:
+On every SET_CONFIGURATION the burn agent emits, unprompted, on bulk IN:
 
 ```
-AB 00 0F "getinfo version"   ->  " version: U-Boot 2016.11-g131d3f2\n[EOT](OK)\r\n"
+"start download process.\0"
 ```
 
-The boot ROM has no command interpreter and may stall on the attempt, so clear
-the halt afterwards before doing anything else.
+The boot ROM never does — verified in the capture, where the agent's greeting
+follows its SET_CONFIGURATION and the boot ROM goes straight from its own to
+the host's first OPEN frame with nothing in between. HiBurn uses this too: it
+never aims a `getinfo` at a boot ROM.
+
+The banner can be asked for again. `usb3_do_set_config()` re-sends it on each
+SET_CONFIGURATION, so a missed read is recoverable by re-issuing the request
+rather than being mistaken for a boot ROM.
+
+### Never send an opcode the device may not implement
+
+`usb3_handle_protocol()` is a chain of `if`/`else if` on the opcode byte **with
+no final `else`**. An unrecognised frame therefore gets no reply *and* — the
+part that bites — no `usb3_bulk_out_transfer_cmd()` call, which is what re-arms
+the OUT endpoint for the next frame. The device simply stops receiving.
+
+So a `getinfo` aimed at a boot ROM does not merely time out; it ends the
+session. Everything after it goes unanswered, including a perfectly correct
+OPEN frame, which looks exactly like a dead or mis-framed device.
+
+Two consequences for a host implementation:
+
+- Discriminate with the banner, never with a command.
+- SET_CONFIGURATION is the way back. `usb3_do_set_config()` calls
+  `usb3_bulk_out_transfer()`, re-arming the endpoint, so a wedged device is
+  recoverable without a power cycle.
+
+And one thing not to do: `clear_halt` is for an actual stall. It also resets
+the endpoint's data toggle, so issuing it after a mere timeout desynchronises
+host and device and breaks the next exchange.
 
 ## Flashing sequence
 
@@ -249,6 +271,9 @@ Finally, `reset`.
 | Zero-length packets during long commands | observed during `sf erase` |
 | Error path stops the session | vendor source (`usb3_prot.c`), not exercised in the capture |
 | Boot ROM stalls on a `FA` first frame | observed on hardware (Hi3518EV300, macOS) |
+| Only the agent sends the banner | capture: agent greets after SET_CONFIGURATION, boot ROM does not |
+| An unimplemented opcode un-arms the OUT endpoint | vendor source (no `else` in `usb3_handle_protocol`), and observed: a `getinfo` to the boot ROM left it silent to every later frame |
+| SET_CONFIGURATION re-arms and re-greets | vendor source (`usb3_do_set_config`) |
 
 The one item resting on source rather than observation is the last: a failed
 command was never provoked in the captured run.

@@ -225,28 +225,37 @@ def _pipe_for_probe(pipe, monkeypatch):
 
 def test_probe_identifies_a_boot_rom(capsys, pipe, monkeypatch):
     _pipe_for_probe(pipe, monkeypatch)
-    pipe.queue_timeout()  # boot ROM sends no greeting
-    pipe.queue_ack()  # answers OPEN, but nothing after that
+    pipe.queue_timeout(2)  # boot ROM sends no greeting, on either attempt
+    pipe.queue_ack()  # but it does acknowledge an OPEN frame
     assert main(["probe", "-v"]) == 0
     out = capsys.readouterr().out
+    assert "greeting: none" in out
     assert "session open (FE): acknowledged" in out
     assert "boot ROM, waiting for a download" in out
 
 
+def test_probe_never_sends_a_command_to_a_boot_rom(pipe, monkeypatch):
+    _pipe_for_probe(pipe, monkeypatch)
+    pipe.queue_timeout(2)
+    pipe.queue_ack()
+    main(["probe", "-v"])
+    assert not any(frame[:1] == b"\xab" for frame in pipe.writes)
+
+
 def test_probe_identifies_a_burn_agent(capsys, pipe, monkeypatch):
     _pipe_for_probe(pipe, monkeypatch)
-    pipe.queue(b"start download process.\x00")
-    pipe.queue_ack()
+    pipe.be_an_agent()
     pipe.queue_command_ok("version: U-Boot 2016.11-g131d3f2\r\n")
     assert main(["probe", "-v"]) == 0
     out = capsys.readouterr().out
     assert "start download process." in out
+    assert "U-Boot 2016.11-g131d3f2" in out
     assert "burn agent, ready to flash" in out
 
 
 def test_probe_reports_a_device_that_answers_nothing(capsys, pipe, monkeypatch):
     _pipe_for_probe(pipe, monkeypatch)
-    pipe.queue_timeout(2)  # silent to both the greeting read and the OPEN frame
+    pipe.queue_timeout(3)  # silent to the greeting reads and the OPEN frame
     assert main(["probe", "-v"]) == 0
     out = capsys.readouterr().out
     assert "session open (FE): no reply" in out
@@ -292,13 +301,12 @@ def test_flash_starts_the_agent_itself_when_it_finds_the_boot_rom(
     bootrom, agent_pipe = FakePipe(), FakePipe()
     _agent_pipe(monkeypatch, [bootrom, agent_pipe])
 
-    # Boot ROM: silent to the greeting, then answers nothing to getinfo.
+    # Boot ROM: no banner, on either attempt.
     bootrom.queue_timeout(2)
     # Stage 1: an ACK for the session open, then a header and tail per image.
     bootrom.queue_ack(7)
     # The agent that comes up afterwards.
-    agent_pipe.queue(b"start download process.\x00")
-    agent_pipe.queue_command_ok("version: U-Boot 2016.11-g131d3f2\r\n")
+    agent_pipe.be_an_agent()
     _queue_erase_only_flash(agent_pipe)
 
     code = main(["flash", "-d", str(release_dir), "-y", "--only", "rootfs_data"])
@@ -332,8 +340,7 @@ def test_flash_does_not_boot_when_the_agent_is_already_up(capsys, release_dir, m
 
     agent_pipe = FakePipe()
     _agent_pipe(monkeypatch, [agent_pipe])
-    agent_pipe.queue_timeout()  # no greeting; it was consumed earlier
-    agent_pipe.queue_command_ok("version: U-Boot 2016.11-g131d3f2\r\n")
+    agent_pipe.be_an_agent()
     _queue_erase_only_flash(agent_pipe)
 
     assert main(["flash", "-d", str(release_dir), "-y", "--only", "rootfs_data"]) == 0

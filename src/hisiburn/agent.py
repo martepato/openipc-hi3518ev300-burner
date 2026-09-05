@@ -31,6 +31,10 @@ ProgressCallback = Callable[[int, int], None]
 #: pipe busy, small enough for responsive progress reporting.
 STREAM_CHUNK = 64 * 1024
 
+#: What the burn agent announces on every SET_CONFIGURATION. The boot ROM
+#: stays silent, which is what distinguishes them.
+GREETING = "start download process"
+
 #: Commands that only talk to the agent return almost immediately.
 DEFAULT_COMMAND_TIMEOUT_MS = 10_000
 
@@ -129,24 +133,40 @@ class BurnAgent:
             log.debug("ping failed: %s", exc)
             return False
 
-    def is_agent(self) -> bool:
+    def is_agent(self, attempts: int = 2) -> bool:
         """Whether a U-Boot burn agent — not the boot ROM — is on the other end.
 
-        Both stages present the same USB descriptors, so the only way to tell
-        them apart is to run a command only U-Boot implements and see whether
-        an ``[EOT]`` comes back.
+        Both stages present identical USB descriptors, so something has to be
+        asked. It must not be a *command*: the gadget's frame handler has no
+        fallback branch, so an opcode the device does not implement gets no
+        reply and, worse, leaves the OUT endpoint un-armed — a `getinfo` aimed
+        at the boot ROM stops it accepting anything further.
+
+        The banner is the safe discriminator. The agent emits it on every
+        SET_CONFIGURATION and the boot ROM never does, which is how HiBurn
+        tells them apart too.
         """
-        try:
-            return self.try_command("getinfo version", timeout_ms=3000).ok
-        except (AgentError, UsbError, protocol.IncompleteResponse) as exc:
-            log.debug("agent probe failed: %s", exc)
-            return False
+        return self.wait_for_greeting(attempts) is not None
 
-    def read_greeting(self, timeout_ms: int = 1500) -> str | None:
-        """Consume the unsolicited "start download process." the agent sends.
+    def wait_for_greeting(self, attempts: int = 2) -> str | None:
+        """Read the agent's banner, re-triggering it if the first read misses."""
+        for attempt in range(attempts):
+            text = self.read_greeting()
+            if text and GREETING in text:
+                return text
+            if attempt + 1 < attempts:
+                try:
+                    self.pipe.reset_configuration()
+                except UsbError as exc:
+                    log.debug("could not re-trigger the greeting: %s", exc)
+                    return None
+        return None
 
-        It arrives once, right after the loaded U-Boot enumerates. Reading it
-        keeps it from being mistaken for the first command's reply.
+    def read_greeting(self, timeout_ms: int = 800) -> str | None:
+        """Consume the unsolicited banner the agent sends on SET_CONFIGURATION.
+
+        Reading it also keeps it from being mistaken for the first command's
+        reply.
         """
         try:
             data = self.pipe.read(timeout_ms=timeout_ms)

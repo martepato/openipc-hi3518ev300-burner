@@ -30,15 +30,31 @@ def test_ping_reports_silence_rather_than_raising(pipe):
     assert not BurnAgent(pipe).ping()
 
 
-def test_is_agent_distinguishes_the_agent_from_the_boot_rom(pipe):
-    # Both stages present identical USB descriptors, so the only way to tell
-    # them apart is whether a U-Boot command comes back with an [EOT].
-    pipe.queue_command_ok("version: U-Boot 2016.11-g131d3f2\r\n")
+def test_is_agent_recognises_the_banner(pipe):
+    pipe.be_an_agent()
     assert BurnAgent(pipe).is_agent()
 
 
-def test_is_agent_is_false_when_nothing_answers(pipe):
+def test_is_agent_is_false_for_a_silent_boot_rom(pipe):
+    pipe.queue_timeout(4)
     assert not BurnAgent(pipe).is_agent()
+
+
+def test_is_agent_never_sends_a_command(pipe):
+    # The gadget's frame handler has no fallback branch: an opcode it does not
+    # implement gets no reply AND no OUT re-arm, so probing a boot ROM with a
+    # command stops it accepting anything afterwards.
+    pipe.queue_timeout(4)
+    BurnAgent(pipe).is_agent()
+    assert not any(frame[:1] == b"\xab" for frame in pipe.writes)
+
+
+def test_is_agent_retriggers_the_banner_if_the_first_read_misses(pipe):
+    # SET_CONFIGURATION makes the agent greet again, so a missed banner is
+    # recoverable rather than a misdiagnosis.
+    pipe.greeting = b"start download process.\x00"
+    assert BurnAgent(pipe).is_agent()
+    assert pipe.configurations_reset == 1
 
 
 def test_read_greeting_returns_the_download_banner(pipe):
