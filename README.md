@@ -257,6 +257,37 @@ directory to find one in — so a full dump supplies its own, from the
 bootloader at its offset 0. `--uboot PATH` overrides that, and a U-Boot
 sitting next to the image is preferred over the embedded one.
 
+### Backing up a camera's flash
+
+```sh
+hisiburn backup mycamera.bin --uboot u-boot-hi3518ev300-universal.bin
+```
+
+```
+  flash: Block:64KB Chip:16MB*1 ID:0x1C 0x70 0x18 Name:"EN25QH128A"
+Reading 16,777,216 bytes from 0x0. This path moves 32 bytes per round trip,
+so expect roughly 18 minutes — it is the only way back without a U-Boot built
+with usbtftp.
+  read [########----------------]  33.4%  5600 KiB   15.8 KiB/s  11.8 min left
+```
+
+**This is slow, unavoidably.** The burn agent has no device-to-host bulk
+transfer unless U-Boot was built with `usbtftp` (OpenIPC's is not — `hisiburn
+info` will say). So the bytes come back as hex text in command replies, about
+32 per 2 ms round trip. A whole 16 MiB chip is roughly 18 minutes; a single
+partition is seconds to a couple of minutes:
+
+```sh
+hisiburn backup settings.bin --offset 0xf90000 --length 0x70000    # ~30 s
+```
+
+What makes it trustworthy rather than merely slow: **every chunk is
+checksummed on the device with `crc32` and compared against what was
+assembled from the text.** A dropped line or a misparsed dump cannot pass
+silently; a failing chunk is re-read before the run gives up. Chunks are
+written and flushed as they complete, so `--resume` continues an interrupted
+run rather than starting over.
+
 ### Verifying what is actually on the camera
 
 ```sh

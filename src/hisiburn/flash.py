@@ -511,3 +511,74 @@ def _explain(agent: BurnAgent, mismatch: Mismatch, staging: int) -> Mismatch:
         log.debug("could not read 0x%X to explain it: %s", mismatch.offset, exc)
         return mismatch
     return replace(mismatch, content=classify_block(head))
+
+
+# --- reading flash back to the host -----------------------------------------
+
+#: How much flash to stage and checksum at a time. Each chunk costs two
+#: commands beyond the dump itself, so larger is marginally faster, but a
+#: smaller chunk means less to redo when one fails its checksum.
+BACKUP_CHUNK = 64 * 1024
+
+
+def run_backup(
+    agent: BurnAgent,
+    destination,
+    offset: int,
+    length: int,
+    staging: int,
+    on_step: StepCallback,
+    on_progress: ProgressCallback | None = None,
+    chunk_size: int = BACKUP_CHUNK,
+    resume_from: int = 0,
+) -> int:
+    """Read flash back to a file, through U-Boot's `md.b`.
+
+    This is the slow path, and unavoidably so: the burn agent has no
+    device-to-host bulk transfer unless U-Boot was built with `usbtftp`, so
+    the bytes come back as hex text in command replies — about 32 per round
+    trip. It is minutes per megabyte rather than seconds.
+
+    What makes it trustworthy rather than merely slow is the checksum: each
+    chunk is checksummed on the device with `crc32` and compared against what
+    was assembled from the text. A dropped line or a misparsed dump cannot
+    pass silently, and a failed chunk is retried before giving up.
+
+    Each verified chunk is written and flushed immediately, so an interrupted
+    run leaves a file that `resume_from` can continue.
+    """
+    if length <= 0:
+        raise PlanError("nothing to read: length must be positive")
+
+    agent.flash_probe()
+    written = resume_from
+
+    for position in range(resume_from, length, chunk_size):
+        want = min(chunk_size, length - position)
+        flash_offset = offset + position
+        label = f"0x{flash_offset:07X}"
+
+        for attempt in range(2):
+            agent.flash_read(staging, flash_offset, want)
+            expected = agent.crc32(staging, want)
+            piece = agent.read_memory(
+                staging, want,
+                on_progress=(
+                    lambda done, total, base=position: on_progress(base + done, length)
+                ) if on_progress else None,
+            )
+            if zlib.crc32(piece) & 0xFFFFFFFF == expected:
+                break
+            on_step(f"{label}: checksum mismatch, re-reading (attempt {attempt + 1})")
+        else:
+            raise PlanError(
+                f"{label}: read back {want} bytes twice and neither matched the "
+                f"device's own checksum ({expected:08x}). The dump text is being "
+                "corrupted in transit."
+            )
+
+        destination.write(piece)
+        destination.flush()
+        written += len(piece)
+
+    return written

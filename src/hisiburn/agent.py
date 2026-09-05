@@ -339,12 +339,15 @@ class BurnAgent:
             )
         return int(match.group(1), 16)
 
-    #: Bytes per `md.b` call. The agent's reply buffer is 200 bytes and U-Boot
-    #: spends about 70 of them per 16-byte line, so two lines is the most that
-    #: survives without being truncated mid-dump.
+    #: Bytes per `md.b` call. The agent appends to a fixed 200-byte reply
+    #: buffer with no bounds check, and U-Boot spends about 79 of those per
+    #: 16-byte line, so two lines is both the most that fits and the most that
+    #: is safe to ask for — a third would overrun the buffer on the device.
     DUMP_STRIDE = 32
 
-    def read_memory(self, address: int, count: int) -> bytes:
+    def read_memory(
+        self, address: int, count: int, on_progress: ProgressCallback | None = None
+    ) -> bytes:
         """Read DRAM back as text, through U-Boot's `md.b`.
 
         This is the only way to see actual bytes on a U-Boot without
@@ -363,6 +366,8 @@ class BurnAgent:
                     "command is unknown, this build has CONFIG_CMD_MEMORY disabled."
                 )
             out += chunk[:want]
+            if on_progress:
+                on_progress(len(out), count)
         return bytes(out[:count])
 
     def has_command(self, name: str) -> bool:

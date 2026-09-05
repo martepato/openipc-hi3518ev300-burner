@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -14,11 +15,13 @@ from hisiburn import __version__
 from hisiburn.agent import AgentError, BurnAgent
 from hisiburn.bootrom import PROFILES, BootRom, BootRomError
 from hisiburn.flash import (
+    BACKUP_CHUNK,
     RESTORE_CHUNK,
     VERIFY_CHUNK,
     PlanError,
     build_plan,
     find_uboot,
+    run_backup,
     run_plan,
     run_restore,
     verify_against_image,
@@ -640,6 +643,93 @@ def cmd_peek(args: argparse.Namespace) -> int:
     return 0
 
 
+class Meter:
+    """Progress with a rate and an estimate, for the operations that take minutes."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.enabled = sys.stdout.isatty()
+        self.started = time.monotonic()
+        self._last = 0.0
+
+    def __call__(self, done: int, total: int) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if done < total and now - self._last < 0.5:
+            return
+        self._last = now
+        elapsed = max(now - self.started, 1e-6)
+        rate = done / elapsed
+        remaining = (total - done) / rate if rate else 0
+        share = done / total if total else 1.0
+        bar = "#" * int(share * 24) + "-" * (24 - int(share * 24))
+        print(
+            f"\r  {self.label} [{bar}] {share * 100:5.1f}%  "
+            f"{done // 1024:>6} KiB  {rate / 1024:5.1f} KiB/s  "
+            f"{remaining / 60:4.1f} min left ",
+            end="\n" if done >= total else "",
+            flush=True,
+        )
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    destination = Path(args.output)
+    resume_from = 0
+    if destination.exists() and args.resume:
+        resume_from = destination.stat().st_size - (
+            destination.stat().st_size % args.chunk
+        )
+        print(f"Resuming {destination.name} at 0x{resume_from:X}")
+    elif destination.exists() and not args.force:
+        raise CliError(
+            f"{destination} exists. Use --resume to continue it, or --force to "
+            "start over."
+        )
+
+    pipe, agent = connect_agent(
+        args.pid, args.wait, resolve_uboot(args.uboot), args.chip
+    )
+    try:
+        info = agent.get_info("spi")
+        step(f"flash: {' '.join(info.split())}")
+        match = re.search(r"Chip:(\d+)MB", info)
+        chip_size = int(match.group(1)) * 1024 * 1024 if match else None
+
+        length = args.length
+        if length is None:
+            if chip_size is None:
+                raise CliError(
+                    "could not read the chip size; pass --length to say how much "
+                    "to read"
+                )
+            length = chip_size - args.offset
+
+        trips = -(-length // 32)
+        print(
+            f"Reading {length:,} bytes from 0x{args.offset:X}. This path moves "
+            f"32 bytes per round trip,\nso expect roughly "
+            f"{trips * 2.0 / 1000 / 60:.0f} minutes — it is the only way back "
+            "without a U-Boot built with usbtftp."
+        )
+
+        mode = "r+b" if resume_from else "wb"
+        with destination.open(mode) as handle:
+            handle.seek(resume_from)
+            written = run_backup(
+                agent, handle, offset=args.offset, length=length,
+                staging=args.staging, on_step=step,
+                on_progress=Meter("read"), chunk_size=args.chunk,
+                resume_from=resume_from,
+            )
+    finally:
+        pipe.close()
+
+    print(f"\nWrote {written:,} bytes to {destination}")
+    print("Every chunk was checked against the device's own crc32.")
+    return 0
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     path = Path(args.image)
     if not path.is_file():
@@ -884,6 +974,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="DRAM address to read through",
     )
     peek.set_defaults(func=cmd_peek)
+
+    backup = sub.add_parser(
+        "backup", parents=[general, device, booting],
+        help="read flash back to a file (slow: no bulk path without usbtftp)",
+    )
+    backup.add_argument("output", help="file to write")
+    backup.add_argument(
+        "--offset", type=lambda v: int(v, 0), default=0, metavar="ADDR",
+        help="flash offset to start at (default 0)",
+    )
+    backup.add_argument(
+        "--length", type=lambda v: int(v, 0), metavar="BYTES",
+        help="how much to read (default: to the end of the chip)",
+    )
+    backup.add_argument(
+        "--chunk", type=lambda v: int(v, 0), default=BACKUP_CHUNK, metavar="BYTES",
+        help="how much to stage and checksum at a time (default 64 KiB)",
+    )
+    backup.add_argument(
+        "--staging", type=lambda v: int(v, 0), default=0x41000000, metavar="ADDR",
+        help="DRAM address to read through",
+    )
+    backup.add_argument("--resume", action="store_true", help="continue an interrupted run")
+    backup.add_argument("--force", action="store_true", help="overwrite an existing file")
+    backup.set_defaults(func=cmd_backup)
 
     verify = sub.add_parser(
         "verify", parents=[general, device, booting],

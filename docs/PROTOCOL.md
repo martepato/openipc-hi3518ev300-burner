@@ -262,6 +262,32 @@ The boot partition is special in HiBurn: it is written straight from
 
 Finally, `reset`.
 
+## Getting data back off the camera
+
+The agent's only device-to-host path is the reply to a command, and that
+reply is copied into a fixed 200-byte buffer. There is no bulk read unless
+U-Boot was built with `usbtftp` — `cmd/Makefile` gates it on `CONFIG_CMD_USB`,
+which OpenIPC's config leaves unset, and its flash-read half is further inside
+`#ifndef CONFIG_MMC`, which that config sets. Two independent reasons it is
+absent from a stock OpenIPC build.
+
+What remains is `md.b`, whose hex dump comes back in that reply buffer:
+
+```
+41000000: 27 05 19 56 63 fd 39 c1 5e 98 76 aa 00 1d 40 5a    '..Vc.9.^.v...@Z
+```
+
+At about 79 characters per 16-byte line, two lines is both the most that fits
+and the most that is *safe* to ask for: `udc_puts()` appends to the buffer
+with no bounds check, so a third line would overrun it on the device. That
+caps a read at **32 bytes per round trip**, and a round trip measured about
+**2 ms** in the capture — so roughly 18 minutes for a 16 MiB chip.
+
+Slow, but checkable: `crc32` runs on the device over the same range, so what
+the host assembled from the text can be compared against what the device
+actually holds, per chunk. That turns an error-prone text channel into one
+that cannot silently corrupt a backup.
+
 ## The agent U-Boot writes to flash when it starts
 
 This one costs data, so it is worth stating plainly.

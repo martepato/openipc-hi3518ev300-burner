@@ -528,3 +528,133 @@ def test_has_command_is_false_when_help_fails(pipe):
 
     pipe.queue_command_error()
     assert not BurnAgent(pipe).has_command("usbtftp")
+
+
+# --- reading flash back to the host -----------------------------------------
+
+
+def _queue_backup_chunk(pipe, payload: bytes, base: int = 0x41000000, crc=None):
+    """Replies for one backup chunk: sf read, crc32, then the md.b dumps."""
+    import zlib
+
+    pipe.queue_command_ok()  # sf read
+    value = zlib.crc32(payload) & 0xFFFFFFFF if crc is None else crc
+    pipe.queue_command_ok(f"crc32 ==> {value:08x}\r\n")
+    for i in range(0, len(payload), 32):
+        pipe.queue_command_ok(_md_reply(payload[i : i + 32], base + i))
+
+
+def test_backup_reads_flash_and_writes_it(pipe, tmp_path):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_backup
+
+    payload = bytes(range(256)) * 4  # 1 KiB
+    pipe.queue_command_ok()  # sf probe
+    _queue_backup_chunk(pipe, payload)
+
+    out = tmp_path / "dump.bin"
+    with out.open("wb") as handle:
+        written = run_backup(BurnAgent(pipe), handle, offset=0, length=len(payload),
+                             staging=0x41000000, on_step=lambda _: None,
+                             chunk_size=len(payload))
+    assert written == len(payload)
+    assert out.read_bytes() == payload
+
+
+def test_backup_checks_every_chunk_against_the_device(pipe, tmp_path):
+    """A misparsed dump must not pass silently, so the device checksums it."""
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_backup
+
+    payload = b"\xa5" * 64
+    pipe.queue_command_ok()
+    # Both attempts return a checksum that does not match the bytes.
+    _queue_backup_chunk(pipe, payload, crc=0xDEADBEEF)
+    _queue_backup_chunk(pipe, payload, crc=0xDEADBEEF)
+
+    with (tmp_path / "dump.bin").open("wb") as handle:
+        with pytest.raises(PlanError, match="corrupted in transit"):
+            run_backup(BurnAgent(pipe), handle, offset=0, length=len(payload),
+                       staging=0x41000000, on_step=lambda _: None,
+                       chunk_size=len(payload))
+
+
+def test_backup_retries_a_bad_chunk_before_giving_up(pipe, tmp_path):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_backup
+
+    payload = b"\x5a" * 64
+    pipe.queue_command_ok()
+    _queue_backup_chunk(pipe, payload, crc=0xDEADBEEF)  # first attempt fails
+    _queue_backup_chunk(pipe, payload)  # retry succeeds
+
+    steps = []
+    with (tmp_path / "dump.bin").open("wb") as handle:
+        run_backup(BurnAgent(pipe), handle, offset=0, length=len(payload),
+                   staging=0x41000000, on_step=steps.append, chunk_size=len(payload))
+    assert any("re-reading" in line for line in steps)
+    assert (tmp_path / "dump.bin").read_bytes() == payload
+
+
+def test_backup_reads_from_the_requested_offset(pipe, tmp_path):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_backup
+
+    payload = b"\x11" * 64
+    pipe.queue_command_ok()
+    _queue_backup_chunk(pipe, payload)
+
+    with (tmp_path / "part.bin").open("wb") as handle:
+        run_backup(BurnAgent(pipe), handle, offset=0xF90000, length=len(payload),
+                   staging=0x41000000, on_step=lambda _: None, chunk_size=len(payload))
+    sent = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
+    assert "sf read 0x41000000 0xf90000 0x40" in sent
+
+
+def test_backup_writes_each_chunk_as_it_goes(pipe, tmp_path):
+    """An interrupted run must leave a file that --resume can continue."""
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_backup
+
+    payload = b"\x01" * 32 + b"\x02" * 32
+    pipe.queue_command_ok()
+    _queue_backup_chunk(pipe, payload[:32])
+    _queue_backup_chunk(pipe, payload[32:], base=0x41000000)
+
+    out = tmp_path / "dump.bin"
+    with out.open("wb") as handle:
+        run_backup(BurnAgent(pipe), handle, offset=0, length=64,
+                   staging=0x41000000, on_step=lambda _: None, chunk_size=32)
+    assert out.read_bytes() == payload
+
+
+def test_backup_can_resume(pipe, tmp_path):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_backup
+
+    payload = b"\x01" * 32 + b"\x02" * 32
+    out = tmp_path / "dump.bin"
+    out.write_bytes(payload[:32])  # first chunk already done
+
+    pipe.queue_command_ok()
+    _queue_backup_chunk(pipe, payload[32:])
+
+    with out.open("r+b") as handle:
+        handle.seek(32)
+        written = run_backup(BurnAgent(pipe), handle, offset=0, length=64,
+                             staging=0x41000000, on_step=lambda _: None,
+                             chunk_size=32, resume_from=32)
+    assert written == 64
+    assert out.read_bytes() == payload
+    sent = [f[3:].decode() for f in pipe.writes if f[:1] == b"\xab"]
+    assert not any("0x0 0x20" in c for c in sent), "must not re-read chunk 0"
+
+
+def test_backup_rejects_a_zero_length(pipe, tmp_path):
+    from hisiburn.agent import BurnAgent
+    from hisiburn.flash import run_backup
+
+    with (tmp_path / "x.bin").open("wb") as handle:
+        with pytest.raises(PlanError, match="length must be positive"):
+            run_backup(BurnAgent(pipe), handle, offset=0, length=0,
+                       staging=0x41000000, on_step=lambda _: None)
